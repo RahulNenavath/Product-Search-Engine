@@ -1,0 +1,61 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3.4.0
+    container_name: opensearch
+    env_file:
+      - dev_settings.env
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+
+      # DEV ONLY — security disabled, password still required by 3.x bootstrap
+      - DISABLE_SECURITY_PLUGIN=true
+
+      # Required by OpenSearch 3.x even if security is disabled
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: product-search-api
+    env_file:
+      - dev_settings.env
+    environment:
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+      - OPENSEARCH_USE_SSL=false
+      - OPENSEARCH_VERIFY_CERTS=false
+      - OPENSEARCH_INDEX=products_bm25
+      - OPENSEARCH_TIMEOUT=30
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  opensearch-data:

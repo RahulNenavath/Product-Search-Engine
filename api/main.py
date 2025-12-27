@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from opensearchpy import OpenSearch
+
+
+# ----------------------------
+# Config
+# ----------------------------
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
+OPENSEARCH_USE_SSL = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+OPENSEARCH_VERIFY_CERTS = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
+OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "products_bm25")
+OPENSEARCH_TIMEOUT = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
+
+FULL_TEXT_FIELD = os.getenv("FULL_TEXT_FIELD", "full_text")
+
+
+def get_client() -> OpenSearch:
+    return OpenSearch(
+        hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+        use_ssl=OPENSEARCH_USE_SSL,
+        verify_certs=OPENSEARCH_VERIFY_CERTS,
+        ssl_show_warn=False,
+        timeout=OPENSEARCH_TIMEOUT,
+    )
+
+
+client = get_client()
+app = FastAPI(title="Product Search API", version="0.1.0")
+
+
+# ----------------------------
+# Schemas
+# ----------------------------
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, description="User search query string")
+    k: int = Field(10, ge=1, le=100, description="Number of results to return")
+    # Optional: if you use this metadata field in your index
+    filter_source: Optional[str] = Field(None, description="Optional source filter: ESCI or WANDS")
+
+
+class SearchHit(BaseModel):
+    product_id: Optional[str]
+    score: float
+    source: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SearchResponse(BaseModel):
+    index: str
+    query: str
+    k: int
+    hits: List[SearchHit]
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def bm25_query_body(query: str, k: int, filter_source: Optional[str]) -> Dict[str, Any]:
+    """
+    Uses multi_match if you have common title fields in metadata, otherwise falls back to full_text match.
+    Adjust boosts to your needs.
+    """
+    must_clause: Dict[str, Any] = {
+        "multi_match": {
+            "query": query,
+            "fields": [
+                "metadata.product_title^4",
+                "metadata.product_name^4",
+                "full_text",
+            ],
+            "type": "best_fields",
+        }
+    }
+
+    if filter_source:
+        return {
+            "size": k,
+            "query": {
+                "bool": {
+                    "must": must_clause,
+                    "filter": [{"term": {"source": filter_source}}],
+                }
+            },
+        }
+
+    return {"size": k, "query": must_clause}
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    try:
+        info = client.info()
+        return {"ok": True, "opensearch": {"cluster_name": info.get("cluster_name"), "version": info.get("version")}}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"OpenSearch not reachable: {e}")
+
+
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest) -> SearchResponse:
+    try:
+        body = bm25_query_body(req.query, req.k, req.filter_source)
+        res = client.search(index=OPENSEARCH_INDEX, body=body)
+        hits_raw = res.get("hits", {}).get("hits", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+
+    hits: List[SearchHit] = []
+    for h in hits_raw:
+        src = h.get("_source") or {}
+        hits.append(
+            SearchHit(
+                product_id=src.get("product_id"),
+                score=float(h.get("_score", 0.0)),
+                source=src.get("source"),
+                metadata=src.get("metadata") or {},
+            )
+        )
+
+    return SearchResponse(index=OPENSEARCH_INDEX, query=req.query, k=req.k, hits=hits)
