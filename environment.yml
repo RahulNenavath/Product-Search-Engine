@@ -1,0 +1,29 @@
+name: product_search_env
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Core
+  - python=3.12
+  - pip
+
+  - pip:
+    - ipykernel
+    - tqdm
+    - numpy
+    - pandas
+    - pyarrow
+    - boto3
+    - s3fs
+    - scikit-learn
+    - jupyterlab
+    - torch
+    - transformers
+    - accelerate
+    - peft
+    - trl
+    - datasets
+    - evaluate
+    - huggingface_hub
+    - sentence-transformers
