@@ -27,3 +27,4 @@ dependencies:
     - evaluate
     - huggingface_hub
     - sentence-transformers
+    - ranx
