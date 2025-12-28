@@ -43,7 +43,7 @@ import json
 import os
 import torch
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-
+from tqdm.auto import tqdm
 from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
 
@@ -226,21 +226,33 @@ def bulk_ingest_bm25(
     product_ids: List[str],
     batch_size: int = 1000,
 ) -> None:
-    for chunk in batched(product_ids, batch_size):
-        actions = []
-        for pid in chunk:
-            meta = product_store.get(pid)
-            if meta is None:
-                continue
-            doc = {
-                "product_id": pid,
-                "source": infer_source_from_id(pid),
-                "full_text": build_full_text(meta),
-                "metadata": meta,
-            }
-            actions.append({"_op_type": "index", "_index": index_name, "_id": pid, "_source": doc})
-        if actions:
-            helpers.bulk(client, actions)
+    total = len(product_ids)
+
+    with tqdm(total=total, desc=f"BM25 ingest → {index_name}", unit="docs") as pbar:
+        for chunk in batched(product_ids, batch_size):
+            actions = []
+            for pid in chunk:
+                meta = product_store.get(pid)
+                if meta is None:
+                    continue
+                doc = {
+                    "product_id": pid,
+                    "source": infer_source_from_id(pid),
+                    "full_text": build_full_text(meta),
+                    "metadata": meta,
+                }
+                actions.append({
+                    "_op_type": "index",
+                    "_index": index_name,
+                    "_id": pid,
+                    "_source": doc,
+                })
+
+            if actions:
+                helpers.bulk(client, actions)
+
+            pbar.update(len(chunk))
+
     client.indices.refresh(index=index_name)
 
 
@@ -257,40 +269,58 @@ def bulk_ingest_hnsw(
     encode_batch_size: int = 64,
     normalize_embeddings: bool = True,
 ) -> None:
-    for chunk in batched(product_ids, batch_size):
-        metas = [product_store.get(pid) for pid in chunk]
-        ids_and_texts: List[Tuple[str, str, Dict[str, Any]]] = []
-        for pid, meta in zip(chunk, metas):
-            if meta is None:
+    total = len(product_ids)
+
+    with tqdm(total=total, desc=f"HNSW ingest → {index_name}", unit="docs") as pbar:
+        for chunk in batched(product_ids, batch_size):
+            metas = [product_store.get(pid) for pid in chunk]
+            ids_and_texts: List[Tuple[str, str, Dict[str, Any]]] = []
+
+            for pid, meta in zip(chunk, metas):
+                if meta is None:
+                    continue
+                ids_and_texts.append((pid, build_full_text(meta), meta))
+
+            if not ids_and_texts:
+                pbar.update(len(chunk))
                 continue
-            ids_and_texts.append((pid, build_full_text(meta), meta))
 
-        if not ids_and_texts:
-            continue
+            texts = [t for _, t, _ in ids_and_texts]
 
-        texts = [t for _, t, _ in ids_and_texts]
-        vecs = embedder.encode(
-            texts,
-            batch_size=min(encode_batch_size, len(texts)),
-            show_progress_bar=False,
-            normalize_embeddings=normalize_embeddings,
-        )
-        vecs_list = vecs.tolist()
+            vecs = embedder.encode(
+                texts,
+                batch_size=min(encode_batch_size, len(texts)),
+                show_progress_bar=False,  # tqdm already used
+                normalize_embeddings=normalize_embeddings,
+                convert_to_numpy=True,
+            )
 
-        actions = []
-        for (pid, text, meta), vec in zip(ids_and_texts, vecs_list):
-            if len(vec) != dim:
-                raise ValueError(f"Embedding dimension mismatch for {pid}: got {len(vec)} expected {dim}")
-            doc = {
-                "product_id": pid,
-                "source": infer_source_from_id(pid),
-                "full_text": text,
-                "metadata": meta,
-                vector_field: vec,
-            }
-            actions.append({"_op_type": "index", "_index": index_name, "_id": pid, "_source": doc})
+            vecs_list = vecs.tolist()
 
-        helpers.bulk(client, actions)
+            actions = []
+            for (pid, text, meta), vec in zip(ids_and_texts, vecs_list):
+                if len(vec) != dim:
+                    raise ValueError(
+                        f"Embedding dimension mismatch for {pid}: got {len(vec)} expected {dim}"
+                    )
+                doc = {
+                    "product_id": pid,
+                    "source": infer_source_from_id(pid),
+                    "full_text": text,
+                    "metadata": meta,
+                    vector_field: vec,
+                }
+                actions.append({
+                    "_op_type": "index",
+                    "_index": index_name,
+                    "_id": pid,
+                    "_source": doc,
+                })
+
+            if actions:
+                helpers.bulk(client, actions)
+
+            pbar.update(len(chunk))
 
     client.indices.refresh(index=index_name)
 

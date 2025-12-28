@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
+from sentence_transformers import SentenceTransformer
 
 
 # ----------------------------
@@ -19,6 +20,12 @@ OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "products_bm25")
 OPENSEARCH_TIMEOUT = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
 
 FULL_TEXT_FIELD = os.getenv("FULL_TEXT_FIELD", "full_text")
+
+EMBEDDING_MODEL = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    device="cuda"  # cpu | cuda | mps
+)
+VECTOR_FIELD = "embedding"
 
 
 def get_client() -> OpenSearch:
@@ -92,6 +99,37 @@ def bm25_query_body(query: str, k: int, filter_source: Optional[str]) -> Dict[st
 
     return {"size": k, "query": must_clause}
 
+def hnsw_query_body(
+    query_vector: List[float],
+    k: int,
+    filter_source: Optional[str],
+) -> Dict[str, Any]:
+
+    knn_query = {
+        "field": VECTOR_FIELD,
+        "query_vector": query_vector,
+        "k": k,
+        "num_candidates": max(100, k * 5),
+    }
+
+    if filter_source:
+        return {
+            "size": k,
+            "query": {
+                "bool": {
+                    "filter": [{"term": {"source": filter_source}}],
+                    "must": [{"knn": knn_query}],
+                }
+            },
+        }
+
+    return {
+        "size": k,
+        "query": {
+            "knn": knn_query
+        },
+    }
+
 
 # ----------------------------
 # Routes
@@ -127,3 +165,66 @@ def search(req: SearchRequest) -> SearchResponse:
         )
 
     return SearchResponse(index=OPENSEARCH_INDEX, query=req.query, k=req.k, hits=hits)
+
+
+@app.post("/search/bm25", response_model=SearchResponse)
+def search_bm25(req: SearchRequest) -> SearchResponse:
+    try:
+        body = bm25_query_body(req.query, req.k, req.filter_source)
+        res = client.search(index=OPENSEARCH_BM25_INDEX, body=body)
+        hits_raw = res.get("hits", {}).get("hits", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"BM25 search failed: {e}")
+
+    hits: List[SearchHit] = []
+    for h in hits_raw:
+        src = h.get("_source") or {}
+        hits.append(
+            SearchHit(
+                product_id=src.get("product_id"),
+                score=float(h.get("_score", 0.0)),
+                source=src.get("source"),
+                metadata=src.get("metadata") or {},
+            )
+        )
+
+    return SearchResponse(
+        index=OPENSEARCH_BM25_INDEX,
+        query=req.query,
+        k=req.k,
+        hits=hits,
+    )
+
+@app.post("/search/hnsw", response_model=SearchResponse)
+def search_hnsw(req: SearchRequest) -> SearchResponse:
+    try:
+        query_vector = EMBEDDING_MODEL.encode(
+            req.query,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).tolist()
+
+        body = hnsw_query_body(query_vector, req.k, req.filter_source)
+        res = client.search(index=OPENSEARCH_HNSW_INDEX, body=body)
+        hits_raw = res.get("hits", {}).get("hits", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"HNSW search failed: {e}")
+
+    hits: List[SearchHit] = []
+    for h in hits_raw:
+        src = h.get("_source") or {}
+        hits.append(
+            SearchHit(
+                product_id=src.get("product_id"),
+                score=float(h.get("_score", 0.0)),
+                source=src.get("source"),
+                metadata=src.get("metadata") or {},
+            )
+        )
+
+    return SearchResponse(
+        index=OPENSEARCH_HNSW_INDEX,
+        query=req.query,
+        k=req.k,
+        hits=hits,
+    )

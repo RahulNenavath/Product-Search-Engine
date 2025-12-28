@@ -13,7 +13,7 @@ services:
       - DISABLE_SECURITY_PLUGIN=true
 
       # Required by OpenSearch 3.x even if security is disabled
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      # - OPENSEARCH_INITIAL_ADMIN_PASSWORD="ChangeMe123!"
 
     ulimits:
       memlock:
