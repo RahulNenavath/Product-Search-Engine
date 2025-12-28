@@ -28,3 +28,4 @@ dependencies:
     - huggingface_hub
     - sentence-transformers
     - ranx
+    - opensearch-py

@@ -38,15 +38,34 @@ Notes
 
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
+import torch
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
+
+
+# ----------------------------
+# Model Device Setup
+# ----------------------------
+
+def load_embedder(model_name: str) -> tuple[SentenceTransformer, str]:
+    """
+    Returns (embedder, device_str).
+    Prefers Apple Silicon GPU via MPS when available.
+    """
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    embedder = SentenceTransformer(model_name, device=device)
+    return embedder, device
 
 
 # ----------------------------
@@ -352,7 +371,9 @@ def main() -> None:
 
     # Ingest HNSW
     if not args.no_hnsw:
-        embedder = SentenceTransformer(args.model)
+        embedder, device = load_embedder(args.model)
+        print(f"[INFO] SentenceTransformer device = {device}")
+
         dim = int(embedder.get_sentence_embedding_dimension())
 
         create_hnsw_index(
