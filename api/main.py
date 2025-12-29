@@ -8,22 +8,33 @@ from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
 from sentence_transformers import SentenceTransformer
 
+import torch
+
+print("[BOOT] torch:", torch.__version__)
+print("[BOOT] cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("[BOOT] gpu:", torch.cuda.get_device_name(0))
+
 
 # ----------------------------
 # Config
-# ----------------------------
+# ---------------------------- 
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
 OPENSEARCH_USE_SSL = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
 OPENSEARCH_VERIFY_CERTS = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "products_bm25")
 OPENSEARCH_TIMEOUT = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
+OPENSEARCH_BM25_INDEX = os.getenv("OPENSEARCH_BM25_INDEX", "products_bm25")
+OPENSEARCH_HNSW_INDEX = os.getenv("OPENSEARCH_HNSW_INDEX", "products_hnsw")
 
 FULL_TEXT_FIELD = os.getenv("FULL_TEXT_FIELD", "full_text")
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 EMBEDDING_MODEL = SentenceTransformer(
     "sentence-transformers/all-MiniLM-L6-v2",
-    device="cuda"  # cpu | cuda | mps
+    device=device  # cpu | cuda | mps
 )
 VECTOR_FIELD = "embedding"
 
@@ -55,6 +66,7 @@ class SearchRequest(BaseModel):
 class SearchHit(BaseModel):
     product_id: Optional[str]
     score: float
+    full_text: str
     source: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -102,32 +114,33 @@ def bm25_query_body(query: str, k: int, filter_source: Optional[str]) -> Dict[st
 def hnsw_query_body(
     query_vector: List[float],
     k: int,
-    filter_source: Optional[str],
+    filter_source: Optional[str] = None,
 ) -> Dict[str, Any]:
 
     knn_query = {
-        "field": VECTOR_FIELD,
-        "query_vector": query_vector,
-        "k": k,
-        "num_candidates": max(100, k * 5),
+        "knn": {
+            VECTOR_FIELD: {
+                "vector": query_vector,
+                "k": k,
+            }
+        }
     }
 
     if filter_source:
+        # Note: filtering is applied on the candidate results returned by ANN in this approach
         return {
             "size": k,
             "query": {
                 "bool": {
                     "filter": [{"term": {"source": filter_source}}],
-                    "must": [{"knn": knn_query}],
+                    "must": [knn_query],
                 }
             },
         }
 
     return {
         "size": k,
-        "query": {
-            "knn": knn_query
-        },
+        "query": knn_query,
     }
 
 
@@ -161,6 +174,7 @@ def search(req: SearchRequest) -> SearchResponse:
                 score=float(h.get("_score", 0.0)),
                 source=src.get("source"),
                 metadata=src.get("metadata") or {},
+                full_text=src.get("full_text") or "",
             )
         )
 
@@ -185,6 +199,7 @@ def search_bm25(req: SearchRequest) -> SearchResponse:
                 score=float(h.get("_score", 0.0)),
                 source=src.get("source"),
                 metadata=src.get("metadata") or {},
+                full_text=src.get("full_text") or "",
             )
         )
 
@@ -219,6 +234,7 @@ def search_hnsw(req: SearchRequest) -> SearchResponse:
                 score=float(h.get("_score", 0.0)),
                 source=src.get("source"),
                 metadata=src.get("metadata") or {},
+                full_text=src.get("full_text") or "",
             )
         )
 

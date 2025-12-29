@@ -1,3 +1,6 @@
+-index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+
 ipykernel
 tqdm
 numpy
@@ -7,7 +10,7 @@ boto3
 s3fs
 scikit-learn
 jupyterlab
-torch
+torch==2.9.0
 transformers
 accelerate
 peft
@@ -15,6 +18,6 @@ trl
 datasets
 evaluate
 huggingface_hub
-sentence-transformers
+sentence-transformers==5.2.0
 ranx
-opensearch-py
+opensearch-py==3.1.0

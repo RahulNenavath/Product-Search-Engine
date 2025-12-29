@@ -15,27 +15,6 @@ Then:
        - BM25 index (text)
        - HNSW k-NN index (vector)
   4) Bulk ingest into OpenSearch
-
-Usage
------
-python ingestion.py \
-  --opensearch-host localhost \
-  --opensearch-port 9200 \
-  --train-qrels ./data/train_qrels.json \
-  --train-query-table ./data/train_query_table.parquet \
-  --product-store ./data/product_store.json \
-  --bm25-index products_bm25 \
-  --hnsw-index products_hnsw \
-  --model sentence-transformers/all-MiniLM-L6-v2 \
-  --batch-size 512
-
-Notes
------
-- Assumes OpenSearch 3.x with k-NN plugin for knn_vector/HNSW.
-- If you only want BM25 ingestion, pass --no-hnsw.
-- Embeddings are computed from "full_text" (recommended). If you truly want only product names,
-  use --embed-field product_name (but you’ll likely get worse retrieval).
-
 """
 
 import argparse
@@ -79,11 +58,9 @@ def build_full_text(meta: Dict[str, Any]) -> str:
     """
     fields = [
         # ESCI common
-        "product_title", "product_brand", "product_color_name",
-        "product_bullet_point", "product_description",
+        "product_title", "product_brand",
         # WANDS/common ecommerce
-        "product_name", "brand", "color", "category", "category_hierarchy",
-        "product_features", "description", "title",
+        "product_name", "product_class",
     ]
     parts: List[str] = []
     for f in fields:
