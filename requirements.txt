@@ -1,6 +1,3 @@
--index-url https://download.pytorch.org/whl/cu128
---extra-index-url https://pypi.org/simple
-
 ipykernel
 tqdm
 numpy
@@ -13,8 +10,7 @@ jupyterlab
 torch==2.9.0
 transformers
 accelerate
-peft
-trl
+pydantic==2.10.4
 datasets
 evaluate
 huggingface_hub

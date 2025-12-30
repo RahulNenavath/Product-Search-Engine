@@ -35,7 +35,7 @@ def build_perfect_run_from_qrels(
 
 
 @dataclass(frozen=True)
-class RanxEvaluator:
+class SearchEvaluator:
     """
     Evaluates retrieval quality using ranx.
 
@@ -127,6 +127,7 @@ class RanxEvaluator:
         run_dict: ScoredRun = {}
         for qid, docs in predicted_rankings.items():
             if not docs:
+                run_dict[str(qid)] = {}
                 continue
             scored: Dict[str, float] = {}
             n = len(docs)
@@ -167,7 +168,7 @@ class RanxEvaluator:
 
         # graded metrics
         if binary_threshold is None:
-            scores = evaluate(Qrels(gt), run_obj, self._metric_names())
+            scores = evaluate(Qrels(gt), run_obj, self._metric_names(), make_comparable=True)
             return (
                 pd.DataFrame([{
                     "metric": m.split("@")[0],
@@ -179,7 +180,7 @@ class RanxEvaluator:
             )
 
         # NDCG graded
-        ndcg_scores = evaluate(Qrels(gt), run_obj, [f"ndcg@{k}" for k in self.ks])
+        ndcg_scores = evaluate(Qrels(gt), run_obj, [f"ndcg@{k}" for k in self.ks], make_comparable=True)
 
         # Recall/MRR binary
         bin_gt = self.binarize_qrels(gt, threshold=binary_threshold, keep_all_queries=True)
@@ -187,8 +188,8 @@ class RanxEvaluator:
             Qrels(bin_gt),
             run_obj,
             [f"recall@{k}" for k in self.ks] + [f"mrr@{k}" for k in self.ks],
-        )
-
+            make_comparable=True,
+            )
         rows = []
         for k in self.ks:
             rows.append({"metric": "recall", "k": k, "score": float(rm_scores.get(f"recall@{k}", 0.0))})
@@ -211,7 +212,7 @@ if __name__ == "__main__":
     
     predicted_rankings = build_perfect_run_from_qrels(ground_truth_test_qrels)
      
-    evaluator_pipeline = RanxEvaluator(ks=[5, 10, 20])
+    evaluator_pipeline = SearchEvaluator(ks=[5, 10, 20])
     
     summary = evaluator_pipeline.evaluate_rankings(
         ground_truth_qrels=ground_truth_test_qrels,
