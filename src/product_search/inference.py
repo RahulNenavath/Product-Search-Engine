@@ -1,10 +1,12 @@
 import os
 import torch
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Sequence, Any, Dict, List, Optional, Sequence
 from pydantic import BaseModel, Field
 from opensearchpy import OpenSearch
-from sentence_transformers import SentenceTransformer
+from collections import defaultdict
+from typing import Iterable, Tuple
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="User search query string")
@@ -64,6 +66,7 @@ class OpenSearchInference:
             ssl_show_warn=False,
             timeout=self.opensearch_config["timeout"]
             )
+    
     @staticmethod
     def bm25_query_body(query: str, k: int, filter_source: Optional[str]) -> Dict[str, Any]:
         """
@@ -94,37 +97,7 @@ class OpenSearchInference:
             }
 
         return {"size": k, "query": must_clause}
-
-    def query_bm25(
-        self,
-        query: str,
-        index: Optional[str] = None,
-        *,
-        k: int = 10,
-        filter_source: Optional[str] = None,
-        include_full_text: bool = False,
-    ) -> List[SearchHit]:
-        
-        if index is None:
-            index = self.bm25_index
-        
-        body = self.bm25_query_body(query, k, filter_source)
-        res = self.client.search(index=index, body=body)
-        hits_raw = res.get("hits", {}).get("hits", [])
-
-        hits: List[SearchHit] = []
-        for h in hits_raw:
-            src = h.get("_source") or {}
-            hit: SearchHit = {
-                "product_id": src.get("product_id") or h.get("_id"),
-                "score": float(h.get("_score", 0.0)),
-                "source": src.get("source"),
-                "metadata": src.get("metadata") or {},
-            }
-            if include_full_text:
-                hit["full_text"] = src.get("full_text")
-            hits.append(hit)
-        return hits
+    
     @staticmethod
     def hnsw_query_body(
         query_vector: List[float],
@@ -158,47 +131,64 @@ class OpenSearchInference:
             "query": knn_query,
         }
 
-    def query_hnsw(
+    @staticmethod
+    def reciprocal_rank_fusion(
+        ranked_lists: Sequence[Sequence[SearchHit]],
+        *,
+        rrf_k: int = 60,
+        top_k: int = 10,
+    ) -> List[Tuple[str, float]]:
+        """
+        Returns ranked (doc_id, fused_score) pairs.
+        fused_score(d) = sum_{lists} 1 / (rrf_k + rank(d))
+        """
+        scores = defaultdict(float)
+
+        for lst in ranked_lists:
+            for rank, hit in enumerate(lst, start=1):
+                doc_id = hit.product_id
+                if not doc_id:
+                    continue
+                scores[str(doc_id)] += 1.0 / (rrf_k + rank)
+
+        fused = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+        return fused[:top_k]
+
+    def query_bm25(
         self,
         query: str,
         index: Optional[str] = None,
         *,
         k: int = 10,
         filter_source: Optional[str] = None,
-        normalize_embeddings: bool = True,
         include_full_text: bool = False,
     ) -> List[SearchHit]:
-
+        
         if index is None:
-            index = self.hnsw_index
-
-        vec = self.embedding_model.encode(
-            query,
-            normalize_embeddings=normalize_embeddings,
-            convert_to_numpy=True,
-        ).tolist()
-
-        body = self.hnsw_query_body(vec, k, filter_source=filter_source)
+            index = self.bm25_index
+        
+        body = self.bm25_query_body(query, k, filter_source)
         res = self.client.search(index=index, body=body)
         hits_raw = res.get("hits", {}).get("hits", [])
 
         hits: List[SearchHit] = []
         for h in hits_raw:
             src = h.get("_source") or {}
-            hit: SearchHit = {
-                "product_id": src.get("product_id") or h.get("_id"),
-                "score": float(h.get("_score", 0.0)),
-                "source": src.get("source"),
-                "metadata": src.get("metadata") or {},
-            }
-            if include_full_text:
-                hit["full_text"] = src.get("full_text")
-            hits.append(hit)
+            hits.append(
+                SearchHit(
+                    product_id=src.get("product_id") or h.get("_id"),
+                    score=float(h.get("_score", 0.0)),
+                    source=src.get("source"),
+                    metadata=src.get("metadata") or {},
+                    full_text=src.get("full_text") if include_full_text else ""
+                    )
+                )
         return hits
 
-    def query_hnsw_with_vector(
+    def query_hnsw(
         self,
-        vector: List[float],
+        query: str,
+        vector: Optional[List[float]] = None,
         index: Optional[str] = None,
         *,
         k: int = 10,
@@ -207,32 +197,144 @@ class OpenSearchInference:
         include_full_text: bool = False,
     ) -> List[SearchHit]:
 
-        if index is None:
-            index = self.hnsw_index
-
-        body = self.hnsw_query_body(vector, k, filter_source=filter_source)
-        res = self.client.search(index=index, body=body)
+        if vector is not None:
+            vec = vector
+        else:
+            vec = self.embedding_model.encode(
+                query,
+                normalize_embeddings=normalize_embeddings,
+                convert_to_numpy=True,
+            ).tolist()
+        
+        body = self.hnsw_query_body(vec, k, filter_source=filter_source)
+        res = self.client.search(index=index if index else self.hnsw_index, body=body)
         hits_raw = res.get("hits", {}).get("hits", [])
 
         hits: List[SearchHit] = []
         for h in hits_raw:
             src = h.get("_source") or {}
-            hit: SearchHit = {
-                "product_id": src.get("product_id") or h.get("_id"),
-                "score": float(h.get("_score", 0.0)),
-                "source": src.get("source"),
-                "metadata": src.get("metadata") or {},
-            }
-            if include_full_text:
-                hit["full_text"] = src.get("full_text")
-            hits.append(hit)
+            hits.append(
+                SearchHit(
+                    product_id=src.get("product_id") or h.get("_id"),
+                    score=float(h.get("_score", 0.0)),
+                    source=src.get("source"),
+                    metadata=src.get("metadata") or {},
+                    full_text=src.get("full_text") if include_full_text else ""
+                    )
+                )
         return hits
 
-    def ranked_ids_bm25(self, query: str, index: Optional[str] = None, *, k: int = 10, filter_source: Optional[str] = None) -> List[str]:
-        return [str(h["product_id"]) for h in self.query_bm25(query, index=index, k=k, filter_source=filter_source)]
+    def query_hybrid_rrf(
+        self,
+        query: str,
+        vector : Optional[List[float]] = None,
+        bm25_index: Optional[str] = None,
+        hnsw_index: Optional[str] = None,
+        *,
+        k: int = 10,
+        filter_source: Optional[str] = None,
+        candidate_pool_size: int = 20,
+        include_full_text: bool = False,
+        rrf_k: int = 60,
+        ) -> List[SearchHit]:
+        """
+        1) Retrieve top-C from BM25 and HNSW
+        2) Fuse via RRF
+        3) Return top-k doc_ids
+        """
 
-    def ranked_ids_hnsw(self, query: str, index: Optional[str] = None, *, k: int = 10, filter_source: Optional[str] = None) -> List[str]:
-        return [str(h["product_id"]) for h in self.query_hnsw(query, index=index, k=k, filter_source=filter_source)]
+        bm25_hits = self.query_bm25(
+            query=query,
+            index=bm25_index if bm25_index else self.bm25_index,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+            )
+        
+        hnsw_hits = self.query_hnsw(
+            query=query,
+            vector=vector,
+            index=hnsw_index if hnsw_index else self.hnsw_index,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+            )
+
+        fused_pairs = self.reciprocal_rank_fusion(
+            [bm25_hits, hnsw_hits], 
+            rrf_k=rrf_k, 
+            top_k=k
+            )
+        if not fused_pairs:
+            return []
+
+        by_id: Dict[str, SearchHit] = {}
+        for h in bm25_hits:
+            if h.product_id:
+                by_id.setdefault(str(h.product_id), h)
+        for h in hnsw_hits:
+            if h.product_id:
+                by_id[str(h.product_id)] = h
+        
+        out: List[SearchHit] = []
+        for pid, fused_score in fused_pairs:
+            base = by_id.get(pid)
+            if base is None:
+                out.append(
+                    SearchHit(
+                        product_id=pid, 
+                        score=float(fused_score), 
+                        source=None, 
+                        metadata={}, 
+                        full_text=""
+                    ))
+            else:
+                out.append(
+                    SearchHit(
+                        product_id=base.product_id,
+                        score=float(fused_score),
+                        source=base.source,
+                        metadata=base.metadata,
+                        full_text=base.full_text if include_full_text else "",
+                    )
+                )
+        return out
+
+    def ranked_ids_bm25(self, query: str, index: Optional[str] = None, *, k: int = 10, filter_source: Optional[str] = None) -> List[str]:
+        return [str(h.product_id) for h in self.query_bm25(query, index=index, k=k, filter_source=filter_source)]
+
+    def ranked_ids_hnsw(
+        self, query: str, 
+        vector: Optional[List[float]] = None, 
+        index: Optional[str] = None, *, k: int = 10, 
+        filter_source: Optional[str] = None
+        ) -> List[str]:
+        return [
+            str(h.product_id) 
+            for h in self.query_hnsw(query, vector=vector, index=index, k=k, filter_source=filter_source)
+            ]
     
-    def ranked_ids_hnsw_with_vector(self, vector: List[float], index: Optional[str] = None, *, k: int = 10, filter_source: Optional[str] = None) -> List[str]:
-        return [str(h["product_id"]) for h in self.query_hnsw_with_vector(vector, index=index, k=k, filter_source=filter_source)]
+    def ranked_ids_hybrid_rrf(
+        self, 
+        query: str,
+        vector: Optional[List[float]] = None,
+        bm25_index: Optional[str] = None,
+        hnsw_index: Optional[str] = None,
+        *, 
+        k: int = 10, 
+        filter_source: Optional[str] = None, 
+        candidate_pool_size: int = 20, 
+        rrf_k: int = 60
+        ) -> List[str]:
+
+        hits = self.query_hybrid_rrf(
+            query=query,
+            vector=vector,
+            k=k,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+            rrf_k=rrf_k,
+            bm25_index=bm25_index,
+            hnsw_index=hnsw_index,
+            )
+        return [str(h.product_id) for h in hits]

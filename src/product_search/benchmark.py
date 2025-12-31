@@ -114,6 +114,54 @@ def retrieve_hnsw(
 
     return preds
 
+def retrieve_hyrid_rrf(
+    inference_client: OpenSearchInference,
+    *,
+    index_bm25: str,
+    index_hnsw: str,
+    query_table: pd.DataFrame,
+    embedder: SentenceTransformer,
+    topn: int,
+    filter_source: Optional[str] = None,
+    encode_batch_size: int = 64,
+    candidate_pool_size: int = 20,
+    rrf_k: int = 60,
+) -> PredictedRankings:
+    preds: PredictedRankings = {}
+
+    # Encode in batches for speed
+    qids = query_table["query_id"].astype(str).tolist()
+    queries = query_table["query"].astype(str).tolist()
+
+    # SentenceTransformer returns np.ndarray; keep as python lists for JSON
+    vecs = embedder.encode(
+        queries,
+        batch_size=min(encode_batch_size, len(queries)),
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=True,
+    )
+
+    for qid, query, qvec in tqdm(
+        zip(qids, queries, vecs),
+        total=len(qids),
+        desc="Hybrid RRF retrieval"
+        ):
+
+        hits = inference_client.ranked_ids_hybrid_rrf(
+            query=query,
+            vector=qvec.tolist(),
+            bm25_index=index_bm25,
+            hnsw_index=index_hnsw,
+            k=topn,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+            rrf_k=rrf_k
+        )
+        preds[qid] = hits
+
+    return preds
+
 
 # ----------------------------
 # Main
