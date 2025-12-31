@@ -36,6 +36,7 @@ class OpenSearchInference:
         bm25_index: str, 
         hnsw_index: str,
         embedding_model: SentenceTransformer,
+        reranker_model: Optional[CrossEncoder] = None,
         opensearch_host: str = os.getenv("OPENSEARCH_HOST", "localhost"),
         opensearch_port: int = int(os.getenv("OPENSEARCH_PORT", "9200")),
         opensearch_use_ssl: bool = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true",
@@ -46,6 +47,7 @@ class OpenSearchInference:
         self.bm25_index = bm25_index
         self.hnsw_index = hnsw_index
         self.embedding_model = embedding_model
+        self.reranker_model = reranker_model
 
         self.opensearch_config = {
             "host": opensearch_host,
@@ -300,6 +302,83 @@ class OpenSearchInference:
                 )
         return out
 
+    def query_hybrid_rerank(
+        self,
+        query: str,
+        vector : Optional[List[float]] = None,
+        bm25_index: Optional[str] = None,
+        hnsw_index: Optional[str] = None,
+        *,
+        k: int = 10,
+        filter_source: Optional[str] = None,
+        candidate_pool_size: int = 20,
+        include_full_text: bool = True,
+        rerank_batch_size: int = 32
+    ) -> List[SearchHit]:
+        """
+        1) Retrieve top-C from BM25 and HNSW (SearchHit objects with metadata)
+        2) Union + de-duplicate by product_id
+        3) Cross-encoder rerank using (query, doc_text)
+        4) Return top-k SearchHit with fused score = reranker score
+        """
+
+        if self.reranker_model is None:
+            raise ValueError("Reranker model not provided.")
+        
+        bm25_hits = self.query_bm25(
+            query=query,
+            index=bm25_index if bm25_index else self.bm25_index,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+        )
+        
+        hnsw_hits = self.query_hnsw(
+            query=query,
+            vector=vector,
+            index=hnsw_index if hnsw_index else self.hnsw_index,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+        )
+
+        by_id: Dict[str, SearchHit] = {}
+        for h in bm25_hits:
+            if h.product_id:
+                by_id.setdefault(str(h.product_id), h)
+        for h in hnsw_hits:
+            if h.product_id:
+                by_id[str(h.product_id)] = h
+        
+        candidates = list(by_id.values())
+        if not candidates:
+            return []
+        
+        pairs: List[Tuple[str, str]] = [(query, h.full_text) for h in candidates]
+        scores = self.reranker_model.predict(
+            pairs,
+            batch_size=rerank_batch_size,
+            show_progress_bar=False,
+            )
+        
+        # Rank by reranker score desc
+        scored = list(zip(candidates, scores))
+        scored.sort(key=lambda x: float(x[1]), reverse=True)
+
+        out: List[SearchHit] = []
+        for hit, s in scored:
+            out.append(
+                SearchHit(
+                    product_id=hit.product_id,
+                    score=float(s),
+                    source=hit.source,
+                    metadata=hit.metadata,
+                    full_text=(hit.full_text if include_full_text else None),
+                )
+            )
+        return out[:k]
+        
+
     def ranked_ids_bm25(self, query: str, index: Optional[str] = None, *, k: int = 10, filter_source: Optional[str] = None) -> List[str]:
         return [str(h.product_id) for h in self.query_bm25(query, index=index, k=k, filter_source=filter_source)]
 
@@ -336,5 +415,32 @@ class OpenSearchInference:
             rrf_k=rrf_k,
             bm25_index=bm25_index,
             hnsw_index=hnsw_index,
+            include_full_text=True,
+            )
+        return [str(h.product_id) for h in hits]
+    
+    def ranked_ids_hybrid_rerank(
+        self, 
+        query: str,
+        vector: Optional[List[float]] = None,
+        bm25_index: Optional[str] = None,
+        hnsw_index: Optional[str] = None,
+        *, 
+        k: int = 10, 
+        filter_source: Optional[str] = None, 
+        candidate_pool_size: int = 20,
+        rerank_batch_size: int = 32
+        ) -> List[str]:
+
+        hits = self.query_hybrid_rerank(
+            query=query,
+            vector=vector,
+            k=k,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+            bm25_index=bm25_index,
+            hnsw_index=hnsw_index,
+            include_full_text=True,
+            rerank_batch_size=rerank_batch_size,
             )
         return [str(h.product_id) for h in hits]
