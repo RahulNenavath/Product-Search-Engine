@@ -3,7 +3,7 @@ services:
     image: opensearchproject/opensearch:3.4.0
     container_name: opensearch
     env_file:
-      - dev_settings.env
+      - dev.env
     environment:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
@@ -33,17 +33,10 @@ services:
       dockerfile: Dockerfile
     container_name: product-search-api
     env_file:
-      - dev_settings.env
+      - dev.env
     environment:
       - OPENSEARCH_HOST=opensearch
       - OPENSEARCH_PORT=9200
-      - OPENSEARCH_USE_SSL=false
-      - OPENSEARCH_VERIFY_CERTS=false
-      - OPENSEARCH_BM25_INDEX=products_bm25
-      - OPENSEARCH_HNSW_INDEX=products_hnsw
-      - OPENSEARCH_TIMEOUT=30
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     gpus: all
     depends_on:
       opensearch:
