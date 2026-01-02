@@ -1,22 +1,3 @@
-"""
-ingestion.py
-
-Purpose
--------
-Build an OpenSearch-ready product corpus from:
-  - train_qrels.json  (ground truth; used to select products to ingest)
-  - train_query_table.(parquet/csv) (not strictly required for ingest, but validated/loaded for completeness)
-  - product_store.json (product_id -> product metadata)
-
-Then:
-  1) Build BM25 "full_text" for each product from its metadata
-  2) Encode products using a SentenceTransformer to create dense vectors
-  3) Create / validate two indices:
-       - BM25 index (text)
-       - HNSW k-NN index (vector)
-  4) Bulk ingest into OpenSearch
-"""
-
 import argparse
 import json
 import os
@@ -79,29 +60,6 @@ def infer_source_from_id(product_id: str) -> str:
     if product_id.startswith("wands_"):
         return "WANDS"
     return "UNKNOWN"
-
-
-# ----------------------------
-# Loading artifacts
-# ----------------------------
-
-def load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_query_table(path: str) -> Any:
-    # Lazy import: avoids pandas dependency if you don't care
-    import pandas as pd
-    if path.endswith(".parquet"):
-        df = pd.read_parquet(path)
-    elif path.endswith(".csv"):
-        df = pd.read_csv(path)
-    else:
-        raise ValueError("train_query_table must be .parquet or .csv")
-    if not {"query_id", "query"}.issubset(set(df.columns)):
-        raise ValueError("train_query_table_df must contain columns: ['query_id', 'query']")
-    return df
 
 
 def collect_product_ids_from_qrels(qrels: Dict[str, Dict[str, Any]]) -> Set[str]:

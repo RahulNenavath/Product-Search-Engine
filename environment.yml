@@ -1,9 +1,0 @@
-name: product_search_env
-channels:
-  - conda-forge
-  - defaults
-
-dependencies:
-  # Core
-  - python=3.12
-  - pip
