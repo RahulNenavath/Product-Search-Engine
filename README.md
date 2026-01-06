@@ -155,11 +155,6 @@ The hyper-params like `C` is set to 30, and `K` is set to 10.
 1) Retrieve a **candidate pool** of size `C` from BM25.
 2) Retrieve a **candidate pool** of size `C` from HNSW.
 3) Fuse ranked lists with **Reciprocal Rank Fusion**:
-
-\[
-\text{score}(d)=\sum_{l \in \text{lists}} \frac{1}{k_{\text{rrf}} + \text{rank}_{l}(d)}
-\]
-
 4) Return top-*k* fused documents.
 
 ---
@@ -237,10 +232,11 @@ This project evaluates retrieval and ranking quality on held-out **test sets** u
 #### 1) Recall@K
 **What it measures:** Coverage of relevant items within the top-K results.
 
-- **Definition:**  
-  \[
-  \text{Recall@K}=\frac{\#\{\text{relevant items in top-K}\}}{\#\{\text{relevant items}\}}
-  \]
+- **Definition:**
+  Recall@K is the fraction of all relevant items for a query that appear within the top K retrieved results.  
+  Concretely: **(number of relevant products in the top K results) divided by (total number of relevant products for that query)**.  
+  The final Recall@K is typically reported as the average across all queries.
+
 - **Interpretation:** Higher Recall@K means the system is better at *retrieving* relevant candidates.  
 - **Why it matters:** Particularly important for two-stage systems: a strong first-stage retriever should maximize recall so that rerankers have good candidates to work with.
 
@@ -250,13 +246,14 @@ This project evaluates retrieval and ranking quality on held-out **test sets** u
 - **Key idea:** Putting a highly relevant item at rank 1 is better than rank 10, and relevance can be graded (not just relevant/irrelevant).
 - **Definition (high level):**
   - DCG@K rewards relevant items near the top with logarithmic discounting:
-    \[
-    \text{DCG@K}=\sum_{i=1}^{K}\frac{2^{rel_i}-1}{\log_2(i+1)}
-    \]
+    DCG@K is computed by summing a gain for each result position from rank 1 to K, where:
+    (1) more relevant items contribute higher gain, and  
+    (2) contributions are **discounted** as rank increases (items appearing later contribute less than those at the top).  
+    In practice, each item’s contribution is divided by a log-based factor depending on its rank.
   - NDCG@K normalizes DCG by the best possible ranking (IDCG):
-    \[
-    \text{NDCG@K}=\frac{\text{DCG@K}}{\text{IDCG@K}}
-    \]
+    NDCG@K is computed as **DCG@K divided by IDCG@K**, where IDCG@K is the DCG@K of an ideal ranking (all most relevant items placed at the top).  
+    This normalization makes scores comparable across queries and bounded between 0 and 1.
+
 - **Interpretation:** Higher NDCG@K means **better ordering** of results, especially at the top ranks.
 - **Why it matters:** This is typically the most informative metric for user-facing search because it emphasizes the head of the ranking.
 
@@ -264,10 +261,11 @@ This project evaluates retrieval and ranking quality on held-out **test sets** u
 **What it measures:** How quickly the first relevant result appears.
 
 - **Definition:**
-  \[
-  \text{MRR@K}=\frac{1}{N}\sum_{q=1}^{N}\frac{1}{\text{rank}_q}
-  \]
-  where \(\text{rank}_q\) is the position of the first relevant item for query \(q\) (capped at K).
+  For each query, find the rank position (1..K) of the **first relevant** product in the returned list.  
+  The reciprocal rank for that query is **1 divided by that rank** (e.g., rank 1 → 1.0, rank 2 → 0.5, rank 5 → 0.2).  
+  If no relevant product appears in the top K, the reciprocal rank is 0.  
+  MRR@K is the average reciprocal rank across all queries.
+
 - **Interpretation:** Higher MRR indicates users are more likely to find a relevant product immediately.
 - **Why it matters:** Strong proxy for “time-to-success” in navigational or single-intent queries.
 
