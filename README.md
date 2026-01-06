@@ -28,40 +28,40 @@ This repository implements and compares multiple retrieval approaches:
 
 ## Data Description
 
-This project benchmarks retrieval and ranking methods using two public product-search relevance datasets: **Wayfair WANDS** and **Amazon Shopping Queries (ESCI)**. Both datasets provide (query, product) pairs with human relevance judgements, enabling reproducible offline evaluation of search quality.  [oai_citation:0‡GitHub](https://github.com/wayfair/WANDS)
+This project benchmarks retrieval and ranking methods using two public product-search relevance datasets: **Wayfair WANDS** and **Amazon Shopping Queries (ESCI)**. Both datasets provide (query, product) pairs with human relevance judgements, enabling reproducible offline evaluation of search quality.
 
 ### Wayfair WANDS (Wayfair ANnotation Dataset)
 
-**WANDS** is a curated product search relevance dataset designed for objective benchmarking in e-commerce search. It contains **42,994 candidate products**, **480 queries**, and **233,448 (query, product) relevance judgements**.  [oai_citation:1‡GitHub](https://github.com/wayfair/WANDS)
+**WANDS** is a curated product search relevance dataset designed for objective benchmarking in e-commerce search. It contains **42,994 candidate products**, **480 queries**, and **233,448 (query, product) relevance judgements**.  [WANDs-GitHub-Repo](https://github.com/wayfair/WANDS)
 
 **Files and schema (CSV):**
 - `product.csv` (catalog / candidates)
   - `product_id`, `product_name`, `product_class`, `category_hierarchy` (delimited by `/`)
   - `product_description`, `product_features` (`|`-delimited attribute:value pairs)
-  - `rating_count`, `average_rating`, `review_count`  [oai_citation:2‡GitHub](https://github.com/wayfair/WANDS)
+  - `rating_count`, `average_rating`, `review_count`
 - `query.csv`
-  - `query_id`, `query`, `query_class`  [oai_citation:3‡GitHub](https://github.com/wayfair/WANDS)
+  - `query_id`, `query`, `query_class`
 - `label.csv` (annotations)
-  - `id`, `query_id`, `product_id`, `label` ∈ {`Exact`, `Partial`, `Irrelevant`}  [oai_citation:4‡GitHub](https://github.com/wayfair/WANDS)
+  - `id`, `query_id`, `product_id`, `label` ∈ {`Exact`, `Partial`, `Irrelevant`}
 
 ### Amazon Shopping Queries Dataset (ESCI)
 
-Amazon’s **Shopping Queries Dataset** (commonly referred to as **ESCI**) is a large-scale benchmark for semantic matching between user shopping queries and products. For each query, it provides up to **40** candidate results with a graded relevance label from the **E/S/C/I** scheme.  [oai_citation:5‡GitHub](https://github.com/amazon-science/esci-data)
+Amazon’s **Shopping Queries Dataset** (commonly referred to as **ESCI**) is a large-scale benchmark for semantic matching between user shopping queries and products. For each query, it provides up to **40** candidate results with a graded relevance label from the **E/S/C/I** scheme.  [Amazon-ESCI-GitHub](https://github.com/amazon-science/esci-data)
 
 **Relevance labels (ESCI):**
 - **Exact (E):** satisfies all query specifications
 - **Substitute (S):** partially satisfies the query but can function as a substitute
 - **Complement (C):** not a match itself, but can be used with an exact match
-- **Irrelevant (I):** unrelated or misses a central requirement  [oai_citation:6‡ar5iv](https://ar5iv.org/pdf/2206.06588)
+- **Irrelevant (I):** unrelated or misses a central requirement  [Amazon-ESCI-Paper-Link](https://ar5iv.org/pdf/2206.06588)
 
 **Dataset size and versions:**
 - Two official versions are provided:
   - **Small (Task 1 / ranking):** ~48,300 unique queries and ~1.1M judgements
-  - **Large (Tasks 2–3):** ~130,652 unique queries and ~2.6M judgements  [oai_citation:7‡GitHub](https://github.com/amazon-science/esci-data)
-- Multilingual queries are included (English, Japanese, Spanish).  [oai_citation:8‡GitHub](https://github.com/amazon-science/esci-data)
+  - **Large (Tasks 2–3):** ~130,652 unique queries and ~2.6M judgements
+- Multilingual queries are included (English, Japanese, Spanish).
 
 **Example-level fields (used as features / metadata):**  
-Each row corresponds to a `<query, product>` judgement and includes identifiers, locale, label, and product text fields such as title, description, bullet points, brand, and color.  [oai_citation:9‡GitHub](https://github.com/amazon-science/esci-data)
+Each row corresponds to a `<query, product>` judgement and includes identifiers, locale, label, and product text fields such as title, description, bullet points, brand, and color.
 
 ### Unified Product Representation in This Repository
 
@@ -78,7 +78,7 @@ For cross-dataset compatibility, the default document text concatenates the most
 - ESCI: `product_title`, `product_brand`
 - WANDS: `product_name`, `product_class`
 
-This yields a concise representation suitable for BM25 indexing and embedding generation, while richer attributes (e.g., descriptions, features, bullets) remain available under `metadata` for future expansion of the indexed text.  [oai_citation:10‡GitHub](https://github.com/wayfair/WANDS)
+This yields a concise representation suitable for BM25 indexing and embedding generation, while richer attributes (e.g., descriptions, features, bullets) remain available under `metadata` for future expansion of the indexed text.
 
 ## Search Engine Architecture
 
@@ -300,8 +300,8 @@ All metrics are computed at:
 1) **Fine-tuning improves dense retrieval materially.**  
 The fine-tuned encoder HNSW matches or slightly exceeds BM25 across all cutoffs (e.g., **0.37 vs 0.37** at NDCG@5; **0.34 vs 0.33** at NDCG@10). This indicates the fine-tuned embedding model better captures domain relevance than the base embedding model.
 
-2) **Hybrid with Fine-tuned Encoder retrieval (RRF) is a strong “no-regret” improvement.**  
-Hybrid + RRF improves over either single retriever, reaching **0.40 / 0.36 / 0.36** at K={5,10,20}. This suggests BM25 and dense retrieval retrieve complementary relevant items, and simple fusion improves overall ranking quality without heavy modeling.
+2) **Hybrid with Fine-tuned Encoder retrieval (RRF) shows strong improvement.**  
+Hybrid + RRF aggregation improves over either single retriever, reaching **0.40 / 0.36 / 0.36** at K={5,10,20}. This suggests BM25 and dense retrieval retrieve complementary relevant items, and simple fusion improves overall ranking quality without heavy modeling.
 
 3) **Hybrid Fine-tuned Encoder + Cross-Encoder is the best-performing configuration.**  
 The cross-encoder reranked hybrid system achieves the highest NDCG at every cutoff (**0.47 / 0.42 / 0.41**). This is consistent with a two-stage architecture where:
