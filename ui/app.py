@@ -24,14 +24,22 @@ with st.sidebar:
 
     search_type = st.radio(
         "Search mode",
-        options=["hybrid", "bm25", "hnsw"],
+        options=["hybrid", "bm25", "hnsw", "hybrid_rerank"],
         format_func=lambda x: {
             "hybrid": "🔀 Hybrid (BM25 + HNSW)",
             "bm25": "📝 BM25 (Keyword)",
             "hnsw": "🧠 HNSW (Semantic)",
+            "hybrid_rerank": "🏆 Hybrid + Reranker (best quality)",
         }[x],
         index=0,
     )
+
+    if search_type == "hybrid_rerank":
+        st.info(
+            "**Cross-encoder reranking** scores every candidate with `BAAI/bge-reranker-v2-m3` "
+            "running on CPU. Expect **30–90 s** per query depending on candidate pool size.",
+            icon="⏳",
+        )
 
     k = st.slider("Results to return (k)", min_value=1, max_value=50, value=10)
 
@@ -60,7 +68,7 @@ with st.sidebar:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 st.title("🔍 Product Search")
-st.caption("Powered by OpenSearch · BM25 · HNSW · Hybrid RRF")
+st.caption("Powered by OpenSearch · BM25 · HNSW · Hybrid RRF · Cross-encoder Reranking")
 
 query = st.text_input(
     label="Search query",
@@ -78,21 +86,45 @@ if search_clicked and query.strip():
     if source_filter != "All":
         payload["filter_source"] = source_filter
 
-    with st.spinner(f"Searching via {search_type.upper()}…"):
-        try:
-            resp = requests.post(
-                f"{API_BASE_URL}/search/{search_type}",
-                json=payload,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.HTTPError as e:
-            st.error(f"Search failed ({e.response.status_code}): {e.response.text}")
-            st.stop()
-        except Exception as e:
-            st.error(f"Request error: {e}")
-            st.stop()
+    timeout = 300 if search_type == "hybrid_rerank" else 15
+
+    if search_type == "hybrid_rerank":
+        with st.status("Reranking in progress — this can take up to 90 s on CPU…", expanded=True) as status:
+            st.write("Retrieving BM25 and HNSW candidates…")
+            st.write("Running cross-encoder reranking on CPU (please wait)…")
+            try:
+                resp = requests.post(
+                    f"{API_BASE_URL}/search/{search_type}",
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                status.update(label="Reranking complete!", state="complete", expanded=False)
+            except requests.exceptions.HTTPError as e:
+                status.update(label="Search failed", state="error", expanded=False)
+                st.error(f"Search failed ({e.response.status_code}): {e.response.text}")
+                st.stop()
+            except Exception as e:
+                status.update(label="Request error", state="error", expanded=False)
+                st.error(f"Request error: {e}")
+                st.stop()
+    else:
+        with st.spinner(f"Searching via {search_type.upper()}…"):
+            try:
+                resp = requests.post(
+                    f"{API_BASE_URL}/search/{search_type}",
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.exceptions.HTTPError as e:
+                st.error(f"Search failed ({e.response.status_code}): {e.response.text}")
+                st.stop()
+            except Exception as e:
+                st.error(f"Request error: {e}")
+                st.stop()
 
     hits = data.get("hits", [])
 

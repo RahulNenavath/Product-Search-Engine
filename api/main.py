@@ -7,10 +7,11 @@ All search logic is delegated to OpenSearchInference (search_pipeline.py),
 which owns BM25, HNSW, and hybrid query construction.
 
 Endpoints:
-  GET  /health          – liveness + OpenSearch connectivity check
-  POST /search/bm25     – BM25 keyword search
-  POST /search/hnsw     – Dense-vector ANN search (fine-tuned encoder)
-  POST /search/hybrid   – Hybrid BM25 + HNSW via Reciprocal Rank Fusion
+  GET  /health                 – liveness + OpenSearch connectivity check
+  POST /search/bm25            – BM25 keyword search
+  POST /search/hnsw            – Dense-vector ANN search (fine-tuned encoder)
+  POST /search/hybrid          – Hybrid BM25 + HNSW via Reciprocal Rank Fusion
+  POST /search/hybrid_rerank   – Hybrid BM25 + HNSW + Cross-encoder reranking
 
 Environment variables (all optional, sensible defaults for local dev):
   OPENSEARCH_HOST          default: localhost
@@ -22,6 +23,8 @@ Environment variables (all optional, sensible defaults for local dev):
   OPENSEARCH_HNSW_INDEX    default: hnsw_index
   EMBEDDING_MODEL_PATH     default: finetuned_encoder
                            (path to the fine-tuned SentenceTransformer directory)
+  RERANKER_MODEL_NAME      default: BAAI/bge-reranker-v2-m3
+                           (HuggingFace model ID for the cross-encoder reranker)
 """
 
 import os
@@ -29,7 +32,7 @@ from typing import Any, Dict
 
 import torch
 from fastapi import FastAPI, HTTPException
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from search_pipeline import (
     OpenSearchInference,
@@ -48,6 +51,7 @@ OPENSEARCH_TIMEOUT      = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
 OPENSEARCH_BM25_INDEX   = os.getenv("OPENSEARCH_BM25_INDEX", "bm25_index")
 OPENSEARCH_HNSW_INDEX   = os.getenv("OPENSEARCH_HNSW_INDEX", "hnsw_index")
 EMBEDDING_MODEL_PATH    = os.getenv("EMBEDDING_MODEL_PATH", "finetuned_encoder")
+RERANKER_MODEL_NAME     = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
@@ -69,12 +73,20 @@ def _load_embedder(model_path: str) -> SentenceTransformer:
     return SentenceTransformer(model_path, device=device)
 
 
+def _load_reranker(model_name: str) -> CrossEncoder:
+    # MPS is unavailable inside Docker; always run the cross-encoder on CPU.
+    print(f"[BOOT] Loading reranker '{model_name}' on cpu")
+    return CrossEncoder(model_name, device="cpu")
+
+
 embedder = _load_embedder(EMBEDDING_MODEL_PATH)
+reranker = _load_reranker(RERANKER_MODEL_NAME)
 
 inference = OpenSearchInference(
     bm25_index=OPENSEARCH_BM25_INDEX,
     hnsw_index=OPENSEARCH_HNSW_INDEX,
     embedding_model=embedder,
+    reranker_model=reranker,
     opensearch_host=OPENSEARCH_HOST,
     opensearch_port=OPENSEARCH_PORT,
     opensearch_use_ssl=OPENSEARCH_USE_SSL,
@@ -143,3 +155,23 @@ def search_hybrid(req: SearchRequest) -> SearchResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hybrid search failed: {e}")
     return SearchResponse(index="hybrid_rrf", query=req.query, k=req.k, hits=hits)
+
+
+@app.post("/search/hybrid_rerank", response_model=SearchResponse)
+def search_hybrid_rerank(req: SearchRequest) -> SearchResponse:
+    """Hybrid BM25 + HNSW retrieval followed by cross-encoder reranking.
+
+    Retrieves a larger candidate pool (default 20 per retriever), unions the
+    results, then scores all candidates with BAAI/bge-reranker-v2-m3 running
+    on CPU.  Expect higher latency (~1-3 s) vs the RRF hybrid endpoint.
+    """
+    try:
+        hits = inference.query_hybrid_rerank(
+            query=req.query,
+            k=req.k,
+            filter_source=req.filter_source,
+            include_full_text=True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hybrid rerank search failed: {e}")
+    return SearchResponse(index="hybrid_rerank", query=req.query, k=req.k, hits=hits)
