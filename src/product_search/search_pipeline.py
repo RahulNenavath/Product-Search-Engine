@@ -72,18 +72,13 @@ class OpenSearchInference:
     @staticmethod
     def bm25_query_body(query: str, k: int, filter_source: Optional[str]) -> Dict[str, Any]:
         """
-        Uses multi_match if you have common title fields in metadata, otherwise falls back to full_text match.
-        Adjust boosts to your needs.
+        Matches against full_text, which is the enriched text field written by
+        DocumentBuilder.for_bm25() during ingestion. It concatenates title, brand,
+        bullets/features, and description — so a single match here covers all signals.
         """
         must_clause: Dict[str, Any] = {
-            "multi_match": {
-                "query": query,
-                "fields": [
-                    "metadata.product_title^4",
-                    "metadata.product_name^4",
-                    "full_text",
-                ],
-                "type": "best_fields",
+            "match": {
+                "full_text": {"query": query},
             }
         }
 
