@@ -8,10 +8,10 @@ on:
       - "embedding_service/**"
 
 env:
-  PROJECT:  ${{ vars.GCP_PROJECT }}
-  REGION:   us-east4
-  SERVICE:  product-search-embedding-service
-  IMAGE:    us-east4-docker.pkg.dev/${{ vars.GCP_PROJECT }}/product-search/embedding-service
+  PROJECT: ${{ vars.GCP_PROJECT }}
+  REGION:  us-east4
+  SERVICE: product-search-embedding-service
+  IMAGE:   us-east4-docker.pkg.dev/${{ vars.GCP_PROJECT }}/product-search/embedding-service
 
 jobs:
   build-and-deploy:
@@ -28,15 +28,15 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Authenticate Docker to Artifact Registry
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker us-east4-docker.pkg.dev --quiet
 
-      # Set up BuildKit for efficient layer caching
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build and push — caches layers in Artifact Registry itself
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
@@ -50,7 +50,6 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:latest
           cache-to: type=inline
 
-      # Deploy to Cloud Run
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
@@ -67,6 +66,9 @@ jobs:
             --timeout=120s
             --execution-environment=gen2
             --allow-unauthenticated
+            --port=8001
+            --startup-cpu-boost
+            --startup-probe-initial-delay-seconds=30
             --add-volume=name=models,type=cloud-storage,bucket=${{ vars.GCS_MODEL_BUCKET }}
             --add-volume-mount=volume=models,mount-path=/models
           env_vars: |
@@ -80,3 +82,5 @@ jobs:
             --project="${{ env.PROJECT }}" \
             --format="value(status.url)")
           echo "Embedding service URL: ${URL}"
+          echo "Add this to your local .env:"
+          echo "  EMBEDDING_SERVICE_URL=${URL}"
