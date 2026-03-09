@@ -1,6 +1,8 @@
-torch==2.6.0
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 opensearch-py==3.1.0
 pydantic==2.10.4
-sentence-transformers==3.3.1
+# torch and sentence-transformers are NOT needed here.
+# All embedding and reranking is handled by the remote Cloud Run embedding service.
+# requests is used for HTTP calls to the embedding service and comes as a
+# transitive dependency of opensearch-py — no explicit pin needed.

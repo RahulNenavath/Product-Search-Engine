@@ -1,0 +1,95 @@
+name: Deploy Embedding Service
+
+# Triggers only when code inside embedding_service/ changes on main.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "embedding_service/**"
+
+env:
+  PROJECT:  ${{ vars.GCP_PROJECT }}      # e.g. product-search-489623
+  REGION:   us-east4
+  SERVICE:  product-search-embedding-service
+  IMAGE:    us-east4-docker.pkg.dev/${{ vars.GCP_PROJECT }}/product-search/embedding-service
+
+jobs:
+  build-and-deploy:
+    name: Build (Cloud Build) → Deploy (Cloud Run GPU)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ── 1. Source ────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. GCP auth ──────────────────────────────────────────────────────────
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ── 3. Build via Cloud Build ──────────────────────────────────────────────
+      # Cloud Build runs on GCP infrastructure (linux/amd64) — no need for
+      # docker buildx / QEMU emulation on the GitHub runner.
+      - name: Submit build to Cloud Build
+        run: |
+          gcloud builds submit \
+            --project="${{ env.PROJECT }}" \
+            --config="embedding_service/cloudbuild.yaml" \
+            --substitutions="_COMMIT_SHA=${{ github.sha }}" \
+            --timeout="3600s" \
+            .
+
+      # ── 4. Deploy to Cloud Run GPU ────────────────────────────────────────────
+      # Fine-tuned encoder is mounted from the GCS bucket at runtime (no model
+      # weights in the image). Reranker is pre-baked into the image.
+      #
+      # Required GitHub variables (repo Settings → Variables):
+      #   GCP_PROJECT       — your GCP project ID
+      #   GCS_MODEL_BUCKET  — GCS bucket containing the finetuned_encoder folder
+      #                       (run scripts/setup-gcs-models.sh once to create it)
+      #
+      # Required GitHub secrets:
+      #   GCP_SA_KEY        — service account JSON key
+      #
+      # Required GCP permissions (run once, then done):
+      #   Cloud Build SA needs:  Artifact Registry Writer
+      #   GitHub SA needs:       Cloud Run Developer, Cloud Build Editor
+      #   Cloud Run runtime SA needs: Storage Object Viewer on GCS_MODEL_BUCKET
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --image="${{ env.IMAGE }}:${{ github.sha }}" \
+            --region="${{ env.REGION }}" \
+            --gpu=1 \
+            --gpu-type=nvidia-l4 \
+            --cpu=8 \
+            --memory=32Gi \
+            --max-instances=1 \
+            --concurrency=4 \
+            --timeout=120s \
+            --execution-environment=gen2 \
+            --set-env-vars="\
+          EMBEDDING_MODEL_PATH=/models/finetuned_encoder,\
+          RERANKER_MODEL_NAME=/models/bge-reranker-v2-m3" \
+            --add-volume="name=models,type=cloud-storage,bucket=${{ vars.GCS_MODEL_BUCKET }}" \
+            --add-volume-mount="volume=models,mount-path=/models" \
+            --allow-unauthenticated \
+            --project="${{ env.PROJECT }}"
+
+      # ── 5. Print service URL ──────────────────────────────────────────────────
+      - name: Print deployed service URL
+        run: |
+          URL=$(gcloud run services describe "${{ env.SERVICE }}" \
+            --region="${{ env.REGION }}" \
+            --project="${{ env.PROJECT }}" \
+            --format="value(status.url)")
+          echo "Embedding service URL: ${URL}"
+          echo "Set EMBEDDING_SERVICE_URL=${URL} in your local api service."

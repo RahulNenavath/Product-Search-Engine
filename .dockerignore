@@ -1,0 +1,39 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.ruff_cache
+.pytest_cache
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Large data / notebooks (not needed in the API image)
+Data/
+notebooks/
+
+# Bruno API collections
+Product-Search-BrunoAPI-Collections/
+
+# Dev tooling
+dev.env
+*.env
+
+# Source files not needed by either Docker image
+src/product_search/benchmarking.py
+src/product_search/evaluation.py
+src/product_search/download_model_from_s3.py
+# finetuned_encoder is no longer COPYd into any image;
+# it lives in GCS and is mounted at Cloud Run runtime.
+src/product_search/finetuned_encoder/
+
+# Deployment artefacts
+runs/
+scripts/

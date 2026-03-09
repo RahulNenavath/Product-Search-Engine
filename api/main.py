@@ -5,6 +5,8 @@ FastAPI product search API backed by OpenSearch.
 
 All search logic is delegated to OpenSearchInference (search_pipeline.py),
 which owns BM25, HNSW, and hybrid query construction.
+Embedding and reranking are offloaded to the remote embedding service
+(running on Cloud Run GPU) — this process loads no ML models.
 
 Endpoints:
   GET  /health                 – liveness + OpenSearch connectivity check
@@ -14,25 +16,22 @@ Endpoints:
   POST /search/hybrid_rerank   – Hybrid BM25 + HNSW + Cross-encoder reranking
 
 Environment variables (all optional, sensible defaults for local dev):
-  OPENSEARCH_HOST          default: localhost
-  OPENSEARCH_PORT          default: 9200
-  OPENSEARCH_USE_SSL       default: false
-  OPENSEARCH_VERIFY_CERTS  default: false
-  OPENSEARCH_TIMEOUT       default: 30
-  OPENSEARCH_BM25_INDEX    default: bm25_index
-  OPENSEARCH_HNSW_INDEX    default: hnsw_index
-  EMBEDDING_MODEL_PATH     default: finetuned_encoder
-                           (path to the fine-tuned SentenceTransformer directory)
-  RERANKER_MODEL_NAME      default: BAAI/bge-reranker-v2-m3
-                           (HuggingFace model ID for the cross-encoder reranker)
+  OPENSEARCH_HOST             default: localhost
+  OPENSEARCH_PORT             default: 9200
+  OPENSEARCH_USE_SSL          default: false
+  OPENSEARCH_VERIFY_CERTS     default: false
+  OPENSEARCH_TIMEOUT          default: 30
+  OPENSEARCH_BM25_INDEX       default: bm25_index
+  OPENSEARCH_HNSW_INDEX       default: hnsw_index
+  EMBEDDING_SERVICE_URL       URL of the Cloud Run embedding service
+                              default: http://localhost:8001
+  EMBEDDING_SERVICE_TIMEOUT   seconds to wait for encode/rerank calls (default: 60)
 """
 
 import os
 from typing import Any, Dict
 
-import torch
 from fastapi import FastAPI, HTTPException
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from search_pipeline import (
     OpenSearchInference,
@@ -43,50 +42,27 @@ from search_pipeline import (
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-OPENSEARCH_HOST         = os.getenv("OPENSEARCH_HOST", "localhost")
-OPENSEARCH_PORT         = int(os.getenv("OPENSEARCH_PORT", "9200"))
-OPENSEARCH_USE_SSL      = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
-OPENSEARCH_VERIFY_CERTS = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
-OPENSEARCH_TIMEOUT      = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
-OPENSEARCH_BM25_INDEX   = os.getenv("OPENSEARCH_BM25_INDEX", "bm25_index")
-OPENSEARCH_HNSW_INDEX   = os.getenv("OPENSEARCH_HNSW_INDEX", "hnsw_index")
-EMBEDDING_MODEL_PATH    = os.getenv("EMBEDDING_MODEL_PATH", "finetuned_encoder")
-RERANKER_MODEL_NAME     = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+OPENSEARCH_HOST           = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT           = int(os.getenv("OPENSEARCH_PORT", "9200"))
+OPENSEARCH_USE_SSL        = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true"
+OPENSEARCH_VERIFY_CERTS   = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower() == "true"
+OPENSEARCH_TIMEOUT        = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
+OPENSEARCH_BM25_INDEX     = os.getenv("OPENSEARCH_BM25_INDEX", "bm25_index")
+OPENSEARCH_HNSW_INDEX     = os.getenv("OPENSEARCH_HNSW_INDEX", "hnsw_index")
+EMBEDDING_SERVICE_URL     = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8001")
+EMBEDDING_SERVICE_TIMEOUT = int(os.getenv("EMBEDDING_SERVICE_TIMEOUT", "60"))
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
-print("[BOOT] torch:", torch.__version__)
-print("[BOOT] cuda available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("[BOOT] gpu:", torch.cuda.get_device_name(0))
-
-
-def _load_embedder(model_path: str) -> SentenceTransformer:
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-    print(f"[BOOT] Loading embedder from '{model_path}' on {device}")
-    return SentenceTransformer(model_path, device=device)
-
-
-def _load_reranker(model_name: str) -> CrossEncoder:
-    # MPS is unavailable inside Docker; always run the cross-encoder on CPU.
-    print(f"[BOOT] Loading reranker '{model_name}' on cpu")
-    return CrossEncoder(model_name, device="cpu")
-
-
-embedder = _load_embedder(EMBEDDING_MODEL_PATH)
-reranker = _load_reranker(RERANKER_MODEL_NAME)
+print(f"[BOOT] OpenSearch : {OPENSEARCH_HOST}:{OPENSEARCH_PORT}")
+print(f"[BOOT] Embedding service : {EMBEDDING_SERVICE_URL}")
 
 inference = OpenSearchInference(
     bm25_index=OPENSEARCH_BM25_INDEX,
     hnsw_index=OPENSEARCH_HNSW_INDEX,
-    embedding_model=embedder,
-    reranker_model=reranker,
+    embedding_service_url=EMBEDDING_SERVICE_URL,
+    embedding_service_timeout=EMBEDDING_SERVICE_TIMEOUT,
     opensearch_host=OPENSEARCH_HOST,
     opensearch_port=OPENSEARCH_PORT,
     opensearch_use_ssl=OPENSEARCH_USE_SSL,
@@ -109,6 +85,7 @@ def health() -> Dict[str, Any]:
                 "cluster_name": info.get("cluster_name"),
                 "version": info.get("version"),
             },
+            "embedding_service": EMBEDDING_SERVICE_URL,
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"OpenSearch not reachable: {e}")
@@ -161,9 +138,9 @@ def search_hybrid(req: SearchRequest) -> SearchResponse:
 def search_hybrid_rerank(req: SearchRequest) -> SearchResponse:
     """Hybrid BM25 + HNSW retrieval followed by cross-encoder reranking.
 
-    Retrieves a larger candidate pool (default 20 per retriever), unions the
-    results, then scores all candidates with BAAI/bge-reranker-v2-m3 running
-    on CPU.  Expect higher latency (~1-3 s) vs the RRF hybrid endpoint.
+    Retrieval runs locally against OpenSearch. Reranking is delegated to the
+    Cloud Run embedding service (GPU). Latency is dominated by network round
+    trip + GPU inference (~1-5 s depending on candidate pool size).
     """
     try:
         hits = inference.query_hybrid_rerank(
