@@ -5,16 +5,16 @@ steps:
       - "build"
       - "--platform=linux/amd64"
       - "--file=embedding_service/Dockerfile"
-      - "--tag=us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:$_COMMIT_SHA"
+      - "--tag=us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:${_COMMIT_SHA}"
       - "--tag=us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:latest"
       - "--cache-from=us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:latest"
       - "."
 
 images:
-  - "us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:$SHORT_SHA"
+  - "us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:${_COMMIT_SHA}"
   - "us-east4-docker.pkg.dev/$PROJECT_ID/product-search/embedding-service:latest"
 
 options:
-  machineType: "E2_HIGHCPU_8"   # faster build for the large CUDA + model image
-  diskSizeGb: 100                 # enough headroom for CUDA base + pre-downloaded reranker
+  machineType: "E2_HIGHCPU_8"
+  diskSizeGb: 50
   logging: CLOUD_LOGGING_ONLY
