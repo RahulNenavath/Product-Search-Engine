@@ -63,12 +63,12 @@ jobs:
             --memory=32Gi
             --max-instances=1
             --concurrency=4
-            --timeout=120s
+            --timeout=300s
             --execution-environment=gen2
             --allow-unauthenticated
             --port=8001
-            --startup-cpu-boost
-            --startup-probe-initial-delay-seconds=30
+            --cpu-boost
+            --startup-probe=tcpSocket.port=8001,initialDelaySeconds=60,failureThreshold=3,timeoutSeconds=10,periodSeconds=30
             --add-volume=name=models,type=cloud-storage,bucket=${{ vars.GCS_MODEL_BUCKET }}
             --add-volume-mount=volume=models,mount-path=/models
           env_vars: |

@@ -29,7 +29,7 @@ RERANKER_MODEL_NAME  = os.getenv("RERANKER_MODEL_NAME",  "/models/bge-reranker-v
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
-print("[BOOT] torch:", torch.__version__)
+print("torch:", torch.__version__)
 print("[BOOT] cuda available:", torch.cuda.is_available())
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
