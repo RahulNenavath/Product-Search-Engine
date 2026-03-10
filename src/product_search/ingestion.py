@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import requests
 import torch
 from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
@@ -206,16 +207,18 @@ class HNSWIndexer(BaseIndexer):
         index_name: str,
         config: HNSWConfig,
         embedder: Optional[SentenceTransformer] = None,
+        embedding_service_url: Optional[str] = None,
         batch_size: int = 256,
         encode_batch_size: int = 64,
         normalize_embeddings: bool = True,
     ) -> None:
         super().__init__(index_name)
-        self._config               = config
-        self._embedder             = embedder
-        self._batch_size           = batch_size
-        self._encode_batch_size    = encode_batch_size
-        self._normalize_embeddings = normalize_embeddings
+        self._config                = config
+        self._embedder              = embedder
+        self._embedding_service_url = embedding_service_url
+        self._batch_size            = batch_size
+        self._encode_batch_size     = encode_batch_size
+        self._normalize_embeddings  = normalize_embeddings
 
     def create_index(self, client: OpenSearch) -> None:
         if client.indices.exists(index=self.index_name):
@@ -264,10 +267,10 @@ class HNSWIndexer(BaseIndexer):
         product_store: Dict[str, Dict[str, Any]],
         product_ids: List[str],
     ) -> None:
-        if self._embedder is None:
+        if self._embedder is None and not self._embedding_service_url:
             raise RuntimeError(
-                "HNSWIndexer.bulk_ingest requires an embedder. "
-                "Pass embedder= to the constructor."
+                "HNSWIndexer.bulk_ingest requires either embedder= or embedding_service_url=. "
+                "Pass one to the constructor."
             )
         cfg = self._config
         with tqdm(total=len(product_ids), desc=f"HNSW ingest → {self.index_name}", unit="docs") as pbar:
@@ -282,13 +285,22 @@ class HNSWIndexer(BaseIndexer):
                     continue
 
                 texts = [t for _, t, _ in valid]
-                vecs: List[List[float]] = self._embedder.encode(
-                    texts,
-                    batch_size=min(self._encode_batch_size, len(texts)),
-                    show_progress_bar=False,
-                    normalize_embeddings=self._normalize_embeddings,
-                    convert_to_numpy=True,
-                ).tolist()
+                if self._embedder is not None:
+                    vecs: List[List[float]] = self._embedder.encode(
+                        texts,
+                        batch_size=min(self._encode_batch_size, len(texts)),
+                        show_progress_bar=False,
+                        normalize_embeddings=self._normalize_embeddings,
+                        convert_to_numpy=True,
+                    ).tolist()
+                else:
+                    resp = requests.post(
+                        f"{self._embedding_service_url.rstrip('/')}/encode",
+                        json={"texts": texts, "normalize": self._normalize_embeddings},
+                        timeout=120,
+                    )
+                    resp.raise_for_status()
+                    vecs = resp.json()["embeddings"]
 
                 actions = []
                 for (pid, _, meta), vec in zip(valid, vecs):
@@ -353,7 +365,8 @@ def bulk_ingest_hnsw(
     index_name: str,
     product_store: Dict[str, Dict[str, Any]],
     product_ids: List[str],
-    embedder: SentenceTransformer,
+    embedder: Optional[SentenceTransformer] = None,
+    embedding_service_url: Optional[str] = None,
     dim: int,
     vector_field: str       = "embedding",
     space_type: str         = "cosinesimil",
@@ -365,6 +378,7 @@ def bulk_ingest_hnsw(
     config = HNSWConfig(dim=dim, vector_field=vector_field, space_type=space_type, engine=engine)
     HNSWIndexer(
         index_name, config=config, embedder=embedder,
+        embedding_service_url=embedding_service_url,
         batch_size=batch_size, encode_batch_size=encode_batch_size,
         normalize_embeddings=normalize_embeddings,
     ).bulk_ingest(client, product_store, product_ids)
@@ -384,6 +398,7 @@ def main() -> None:
     ap.add_argument("--bm25-index",       default=os.getenv("OPENSEARCH_BM25_INDEX", "products_bm25"))
     ap.add_argument("--hnsw-index",       default=os.getenv("OPENSEARCH_HNSW_INDEX", "products_hnsw"))
     ap.add_argument("--vector-field",     default="embedding")
+    ap.add_argument("--embedding-service-url", default=os.getenv("CLOUDRUN_URL") or os.getenv("EMBEDDING_SERVICE_URL"), help="Cloud Run embedding service URL (alternative to loading a local model)")
     ap.add_argument("--model",            default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--batch-size",        type=int, default=1000)
     ap.add_argument("--hnsw-batch-size",   type=int, default=256)
@@ -426,12 +441,26 @@ def main() -> None:
           f"(docs={client.count(index=args.bm25_index)['count']}, {time.time()-t0:.1f}s)")
 
     if not args.no_hnsw:
-        embedder, device = load_embedder(args.model)
-        print(f"[INFO] SentenceTransformer device = {device}")
-        dim = int(embedder.get_sentence_embedding_dimension())
+        emb_url = args.embedding_service_url
+        if emb_url:
+            print(f"[INFO] Using Cloud Run embedding service: {emb_url}")
+            probe = requests.post(
+                f"{emb_url.rstrip('/')}/encode",
+                json={"texts": ["probe"], "normalize": True},
+                timeout=30,
+            )
+            probe.raise_for_status()
+            dim = len(probe.json()["embeddings"][0])
+            embedder = None
+            print(f"[INFO] Embedding dim from service: {dim}")
+        else:
+            embedder, device = load_embedder(args.model)
+            print(f"[INFO] SentenceTransformer device = {device}")
+            dim = int(embedder.get_sentence_embedding_dimension())
         config = HNSWConfig(dim=dim, vector_field=args.vector_field, engine="nmslib")
         hnsw = HNSWIndexer(
             args.hnsw_index, config=config, embedder=embedder,
+            embedding_service_url=emb_url,
             batch_size=args.hnsw_batch_size, encode_batch_size=args.encode_batch_size,
         )
         hnsw.create_index(client)

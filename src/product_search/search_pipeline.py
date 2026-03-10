@@ -1,5 +1,7 @@
 import os
+import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Sequence, Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
@@ -37,8 +39,15 @@ class OpenSearchInference:
         self,
         bm25_index: str,
         hnsw_index: str,
-        embedding_service_url: str,
-        embedding_service_timeout: int = 30,
+        embedding_service_url: str = (
+            os.getenv("CLOUDRUN_URL") or os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8001")
+        ),
+        embedding_service_timeout: int = 60,
+        # Cloud Run is deployed with --concurrency=4 --max-instances=1.
+        # Keep max_workers <= concurrency so we never queue-flood the single instance.
+        embedding_service_max_workers: int = 4,
+        # Max texts per /encode or /rerank HTTP request.
+        encode_batch_size: int = 32,
         opensearch_host: str = os.getenv("OPENSEARCH_HOST", "localhost"),
         opensearch_port: int = int(os.getenv("OPENSEARCH_PORT", "9200")),
         opensearch_use_ssl: bool = os.getenv("OPENSEARCH_USE_SSL", "false").lower() == "true",
@@ -49,6 +58,8 @@ class OpenSearchInference:
         self.hnsw_index = hnsw_index
         self._emb_url = embedding_service_url.rstrip("/")
         self._emb_timeout = embedding_service_timeout
+        self._emb_max_workers = embedding_service_max_workers
+        self._encode_batch_size = encode_batch_size
 
         # Persistent HTTP session for connection pooling to the embedding service
         self._session = requests.Session()
@@ -73,36 +84,91 @@ class OpenSearchInference:
 
     # ── Embedding service calls ───────────────────────────────────────────────
 
+    def _post_with_retry(self, endpoint: str, payload: dict, *, max_retries: int = 3) -> dict:
+        """
+        POST to an embedding service endpoint with exponential back-off retry.
+
+        Retries on 429, 500, 502, 503, 504 and connection errors.
+        Raises EmbeddingServiceError on permanent failure.
+        """
+        url = f"{self._emb_url}/{endpoint.lstrip('/')}"
+        for attempt in range(max_retries):
+            try:
+                resp = self._session.post(url, json=payload, timeout=self._emb_timeout)
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s, 4s …
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise EmbeddingServiceError(f"Embedding service {endpoint} failed: {e}") from e
+        raise EmbeddingServiceError(f"Embedding service {endpoint} failed after {max_retries} retries")
+
     def encode(self, texts: List[str], normalize: bool = True) -> List[List[float]]:
         """
-        Encode a batch of texts to embedding vectors via the remote embedding service.
+        Encode texts to embedding vectors via the remote embedding service.
 
-        Accepts multiple texts at once for efficiency — the service runs GPU-batched
-        inference. Used directly by benchmarking for bulk query pre-encoding.
+        Large lists are automatically split into batches of `encode_batch_size`
+        and sent concurrently up to `embedding_service_max_workers` in-flight
+        requests — matching the Cloud Run --concurrency setting so we never
+        overwhelm the single instance.
         """
-        try:
-            resp = self._session.post(
-                f"{self._emb_url}/encode",
-                json={"texts": texts, "normalize": normalize},
-                timeout=self._emb_timeout,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            raise EmbeddingServiceError(f"Embedding service /encode failed: {e}") from e
-        return resp.json()["embeddings"]
+        if not texts:
+            return []
+
+        batch_size = self._encode_batch_size
+        batches: List[List[str]] = [
+            texts[i : i + batch_size] for i in range(0, len(texts), batch_size)
+        ]
+
+        if len(batches) == 1:
+            data = self._post_with_retry("/encode", {"texts": batches[0], "normalize": normalize})
+            return data["embeddings"]
+
+        # Fan out batches across a thread pool, respecting the service concurrency limit.
+        results: List[Optional[List[List[float]]]] = [None] * len(batches)
+        with ThreadPoolExecutor(max_workers=self._emb_max_workers) as pool:
+            future_to_idx = {
+                pool.submit(
+                    self._post_with_retry,
+                    "/encode",
+                    {"texts": batch, "normalize": normalize},
+                ): idx
+                for idx, batch in enumerate(batches)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result()["embeddings"]
+
+        # Flatten in original order
+        return [vec for batch_result in results for vec in batch_result]  # type: ignore[union-attr]
 
     def _rerank_scores(self, query: str, texts: List[str]) -> List[float]:
-        """Score (query, text) pairs with the cross-encoder via the remote service."""
-        try:
-            resp = self._session.post(
-                f"{self._emb_url}/rerank",
-                json={"query": query, "texts": texts},
-                timeout=self._emb_timeout,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            raise EmbeddingServiceError(f"Embedding service /rerank failed: {e}") from e
-        return resp.json()["scores"]
+        """
+        Score (query, text) pairs with the cross-encoder via the remote service.
+
+        If the candidate list exceeds `encode_batch_size`, it is chunked and sent
+        sequentially (reranking is per-query so parallel batches would return
+        partial score lists that are harder to merge).
+        """
+        if not texts:
+            return []
+
+        batch_size = self._encode_batch_size
+        if len(texts) <= batch_size:
+            data = self._post_with_retry("/rerank", {"query": query, "texts": texts})
+            return data["scores"]
+
+        all_scores: List[float] = []
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            data = self._post_with_retry("/rerank", {"query": query, "texts": chunk})
+            all_scores.extend(data["scores"])
+        return all_scores
 
     # ── OpenSearch query builders ─────────────────────────────────────────────
 
