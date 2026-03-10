@@ -44,7 +44,7 @@ services:
       - OPENSEARCH_PORT=9200
       # Point at the Cloud Run embedding service after deploying it.
       # For local testing you can run embedding_service/ directly on port 8001.
-      - EMBEDDING_SERVICE_URL=${EMBEDDING_SERVICE_URL:-http://localhost:8001}
+      - EMBEDDING_SERVICE_URL=${CLOUDRUN_URL:-${EMBEDDING_SERVICE_URL:-http://localhost:8001}}
       - EMBEDDING_SERVICE_TIMEOUT=60
     depends_on:
       opensearch:

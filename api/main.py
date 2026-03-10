@@ -49,7 +49,7 @@ OPENSEARCH_VERIFY_CERTS   = os.getenv("OPENSEARCH_VERIFY_CERTS", "false").lower(
 OPENSEARCH_TIMEOUT        = int(os.getenv("OPENSEARCH_TIMEOUT", "30"))
 OPENSEARCH_BM25_INDEX     = os.getenv("OPENSEARCH_BM25_INDEX", "bm25_index")
 OPENSEARCH_HNSW_INDEX     = os.getenv("OPENSEARCH_HNSW_INDEX", "hnsw_index")
-EMBEDDING_SERVICE_URL     = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8001")
+EMBEDDING_SERVICE_URL     = os.getenv("CLOUDRUN_URL") or os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8001")
 EMBEDDING_SERVICE_TIMEOUT = int(os.getenv("EMBEDDING_SERVICE_TIMEOUT", "60"))
 
 
