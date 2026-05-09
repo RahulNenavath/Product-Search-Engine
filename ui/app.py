@@ -86,7 +86,12 @@ if search_clicked and query.strip():
     if source_filter != "All":
         payload["filter_source"] = source_filter
 
-    timeout = 300 if search_type == "hybrid_rerank" else 15
+    if search_type == "hybrid_rerank":
+        timeout = 300
+    elif search_type in ("hnsw", "hybrid"):
+        timeout = 120  # Cloud Run cold-start can take 30-90s
+    else:
+        timeout = 15
 
     if search_type == "hybrid_rerank":
         with st.status("Reranking in progress — this can take up to 90 s on CPU…", expanded=True) as status:
@@ -110,7 +115,7 @@ if search_clicked and query.strip():
                 st.error(f"Request error: {e}")
                 st.stop()
     else:
-        with st.spinner(f"Searching via {search_type.upper()}…"):
+        with st.spinner(f"Searching via {search_type.upper()}… (first request may take up to 90 s if the embedding service is cold)" if search_type in ("hnsw", "hybrid") else f"Searching via {search_type.upper()}…"):
             try:
                 resp = requests.post(
                     f"{API_BASE_URL}/search/{search_type}",

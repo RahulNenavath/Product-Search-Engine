@@ -1,6 +1,6 @@
 ipykernel
 tqdm
-numpy
+numpy>=2.0.0
 pandas
 pyarrow
 boto3
@@ -17,3 +17,7 @@ huggingface_hub
 sentence-transformers==5.2.0
 ranx
 opensearch-py==3.1.0
+langchain-google-vertexai==3.2.2
+langchain-core==1.2.18
+langgraph==1.1.1
+langsmith==0.7.16

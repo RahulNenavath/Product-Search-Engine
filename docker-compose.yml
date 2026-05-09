@@ -27,11 +27,6 @@ services:
       timeout: 5s
       retries: 20
 
-  # ── Local orchestrator API (no models, no GPU needed) ──────────────────────
-  # Handles OpenSearch queries and delegates embedding/reranking to the Cloud
-  # Run embedding service via EMBEDDING_SERVICE_URL.
-  # Set EMBEDDING_SERVICE_URL to the Cloud Run URL after deploying:
-  #   EMBEDDING_SERVICE_URL=https://... docker compose up
   api:
     build:
       context: .
@@ -42,10 +37,10 @@ services:
     environment:
       - OPENSEARCH_HOST=opensearch
       - OPENSEARCH_PORT=9200
-      # Point at the Cloud Run embedding service after deploying it.
-      # For local testing you can run embedding_service/ directly on port 8001.
-      - EMBEDDING_SERVICE_URL=${CLOUDRUN_URL:-${EMBEDDING_SERVICE_URL:-http://localhost:8001}}
+      - EMBEDDING_SERVICE_URL=${CLOUDRUN_URL:-http://localhost:8001}
       - EMBEDDING_SERVICE_TIMEOUT=60
+    volumes:
+      - ~/.config/gcloud/application_default_credentials.json:/root/.config/gcloud/application_default_credentials.json:ro
     depends_on:
       opensearch:
         condition: service_healthy
