@@ -79,7 +79,12 @@ To support both BM25 and HNSW retrieval consistently, all products from both dat
 |---|---|---|
 | `product_id` | keyword | Prefixed: `amz_<id>` / `wands_<id>` |
 | `source` | keyword | `"ESCI"` or `"WANDS"` |
-| `full_text` | text | Enriched text: title → brand → bullets → description |
+| `title` | text | Product title — highest BM25 boost (×5) |
+| `brand_text` | text | Brand name — second BM25 boost (×4) |
+| `bullets` | text | Bullet-point attributes — moderate boost (×2) |
+| `description` | text | Long-form description — down-weighted (×0.3) |
+| `full_text` | text | All fields concatenated; used for display |
+| `encode_text` | text | Short form for embeddings: title → brand → color |
 | `brand` | keyword | Normalised, lowercased |
 | `color` | keyword[] | Normalised list (splits compound colour strings) |
 | `product_class` | keyword | High-level category |
@@ -87,12 +92,12 @@ To support both BM25 and HNSW retrieval consistently, all products from both dat
 | `average_rating` | float | WANDS only |
 | `review_count` | integer | WANDS only |
 | `metadata` | object | Full raw product fields, preserved for debugging |
-| `embedding` | knn_vector | Dense vector (HNSW index only) |
+| `embedding` | knn_vector | 384-dim dense vector (HNSW index only) |
 
-**`full_text` construction** concatenates the highest-signal fields in priority order:
+**Field construction:**
 
-- ESCI: `product_title` → `product_brand` → `product_bullet_point` → `product_description`
-- WANDS: `product_name` → `product_class` → `category_hierarchy` → feature values → `product_description`
+- `full_text` — ESCI: `product_title` → `product_brand` → `product_bullet_point` → `product_description`. WANDS: `product_name` → `product_class` → `category_hierarchy` → `feature values` → `product_description`
+- `encode_text` — short-form representation used for embedding: title → brand → color list. Mirrors the text used during encoder fine-tuning to eliminate train/serve mismatch.
 
 ---
 
@@ -159,14 +164,18 @@ Encoding and reranking are **not performed locally** — all calls are proxied t
 ### Strategy A — BM25 (Lexical)
 
 ```
-query → match on full_text → top-k hits (sorted by BM25 score)
+query → _clean_query() → multi_match (title^5, brand_text^4, bullets^2, description^0.3) → top-k
 ```
+
+Multi-field BM25 with `best_fields` scoring. Queries are pre-cleaned to strip conversational filler ("I'm looking for…", "show me some great…") before scoring.
 
 ### Strategy B — HNSW k-NN (Dense / Semantic)
 
 ```
-query → POST /encode (embedding_service) → knn on embedding → top-k hits
+query → POST /encode (embedding_service) → knn on embedding field → top-k hits
 ```
+
+The encoder is called with `encode_text`-style input (title + brand + color) to match the representation used during fine-tuning.
 
 ### Strategy C — Hybrid via Reciprocal Rank Fusion (RRF)
 
@@ -176,7 +185,7 @@ query → BM25 top-C  ─┐
 query → HNSW top-C  ─┘
 ```
 
-Default hyperparameters: `C = 20`, `rrf_k = 60`.
+Default hyperparameters: `C = 50` (candidate pool per method), `rrf_k = 60`.
 
 ### Strategy D — Hybrid + Cross-Encoder Reranking
 
@@ -185,6 +194,8 @@ query → BM25 top-C  ─┐
                       ├→ union/dedup → POST /rerank (embedding_service) → top-k
 query → HNSW top-C  ─┘
 ```
+
+Default hyperparameters: `C = 25` per method (smaller pool → reranker sees higher-precision candidates).
 
 ---
 
@@ -239,24 +250,45 @@ Average of `1 / rank` of the first relevant result across all queries. Strong pr
 
 ## Results
 
-### NDCG@K on Test Set (Combined ESCI + WANDS)
+All metrics are computed on held-out test sets (100 ESCI + 100 WANDS queries), `top-100` retrieval pool, cutoffs K ∈ {5, 10, 20}.
+
+### NDCG@K
 
 | Configuration | NDCG@5 | NDCG@10 | NDCG@20 |
 |---|---|---|---|
-| BM25 | 0.5856 | 0.5646 | 0.5484 |
-| HNSW (Fine-tuned Encoder) | 0.6017 | 0.5854 | 0.5810 |
-| Hybrid RRF (BM25 + HNSW Fine-tuned) | 0.6354 | 0.6175 | **0.6037** |
-| **Hybrid + Cross-Encoder Reranker** | **0.6883** | **0.6453** | 0.5588 |
+| BM25 | 0.6030 | 0.5767 | 0.5530 |
+| HNSW (Fine-tuned Encoder) | 0.6335 | 0.6149 | 0.6031 |
+| Hybrid RRF (BM25 + HNSW, C=50) | 0.6576 | 0.6373 | 0.6176 |
+| **Hybrid + Cross-Encoder Reranker (C=25)** | **0.6824** | **0.6608** | **0.6510** |
+
+### MRR@K
+
+| Configuration | MRR@5 | MRR@10 | MRR@20 |
+|---|---|---|---|
+| BM25 | 0.7598 | 0.7671 | 0.7689 |
+| HNSW (Fine-tuned Encoder) | 0.8141 | 0.8176 | 0.8186 |
+| Hybrid RRF | 0.8418 | 0.8466 | 0.8470 |
+| **Hybrid + Cross-Encoder Reranker** | 0.8262 | 0.8305 | 0.8316 |
+
+### Recall@K
+
+| Configuration | Recall@5 | Recall@10 | Recall@20 |
+|---|---|---|---|
+| BM25 | 0.1544 | 0.2627 | 0.3896 |
+| HNSW (Fine-tuned Encoder) | 0.1662 | 0.2951 | 0.4440 |
+| Hybrid RRF | 0.1705 | 0.2976 | 0.4471 |
+| **Hybrid + Cross-Encoder Reranker** | **0.1839** | **0.3151** | **0.4758** |
 
 ### Key Findings
 
-1. **Fine-tuned encoder outperforms BM25 at every cutoff**, confirming the encoder better captures domain-level relevance beyond keyword overlap.
-2. **Hybrid RRF is a strong, calibration-free improvement** — it reaches NDCG@5 of 0.635 without any additional learned components, and leads all methods at NDCG@20 (0.604).
-3. **Hybrid + Cross-Encoder is the best configuration at shallow cutoffs** (NDCG@5 = 0.688, +17.6% vs BM25), confirming the value of a two-stage architecture: maximise recall in stage 1, maximise precision in stage 2.
-4. **Rank inversion at NDCG@20:** the reranker's benefit is bounded by the size of its candidate pool — Hybrid RRF overtakes it at depth 20 (0.604 vs 0.559), as ordering beyond the reranked window reverts to fused scores.
+1. **Multi-field BM25 with per-field boosting** (`title^5, brand_text^4, bullets^2, description^0.3`) lifts the BM25 baseline from ~0.586 to 0.603 NDCG@5 compared to a single `full_text` field — making it a stronger stage-1 retriever.
+2. **Fine-tuned encoder outperforms BM25 at every cutoff**, confirming the encoder better captures domain-level relevance beyond keyword overlap (+5 pp NDCG@5).
+3. **Hybrid RRF is a strong, calibration-free improvement** — it reaches NDCG@5 = 0.658 without any additional learned components, a +9 pp gain over BM25.
+4. **Hybrid + Cross-Encoder Reranker is the best configuration at all cutoffs** (NDCG@5 = 0.682, +13 pp vs BM25). With a tuned candidate pool of 25, the reranker leads at NDCG@20 = 0.651 as well — there is no longer a depth-based rank inversion.
+5. **MRR is highest for Hybrid RRF** (0.847), slightly above the reranker (0.832), suggesting RRF is better at surfacing *a* relevant result at rank 1, while the reranker better handles the full top-K ordering.
 
-> **For production ranking** (k ≤ 10): use Hybrid + Cross-Encoder Reranker.
-> **For recall-oriented retrieval** (broad candidates, offline indexing): use Hybrid RRF.
+> **For production ranking** (k ≤ 20): use **Hybrid + Cross-Encoder Reranker**.
+> **For recall-oriented retrieval** (broad candidates, fast latency): use **Hybrid RRF**.
 
 ---
 
@@ -625,4 +657,4 @@ Product-Search-Engine/
 
 ---
 
-> **Summary:** Hybrid retrieval with a fine-tuned bi-encoder + cross-encoder reranking is the top-performing configuration (NDCG@5 = 0.688, +17.6% vs BM25). Encoding and reranking are handled by a GPU-backed Cloud Run service that loads models from GCS at boot — keeping Docker images small and model updates independent of application deploys. The local stack (OpenSearch + FastAPI + Streamlit) runs entirely in Docker Compose.
+> **Summary:** Hybrid retrieval with a fine-tuned bi-encoder + cross-encoder reranking is the top-performing configuration at all depth cutoffs (NDCG@5 = 0.682, NDCG@10 = 0.661, NDCG@20 = 0.651 — all best-in-class). BM25 uses multi-field boosting across `title`, `brand_text`, `bullets`, and `description`; the dense encoder uses a short `encode_text` field (title + brand + color) matching its fine-tuning representation. Encoding and reranking are handled by a GPU-backed Cloud Run service that loads models from GCS at boot — keeping Docker images small and model updates independent of application deploys. The local stack (OpenSearch + FastAPI + Streamlit) runs entirely in Docker Compose.
