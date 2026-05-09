@@ -73,21 +73,15 @@ def retrieve_hnsw(
     query_table: pd.DataFrame,
     topn: int,
     filter_source: Optional[str] = None,
-    encode_batch_size: int = 64,
+    query_vectors: Optional[list] = None,
 ) -> PredictedRankings:
     preds: PredictedRankings = {}
-
     qids = query_table["query_id"].astype(str).tolist()
-    queries = query_table["query"].astype(str).tolist()
-
-    # Batch-encode all queries in one HTTP call to the embedding service.
-    # This is more efficient than encoding inside ranked_ids_hnsw one at a time.
-    print(f"[HNSW] Batch-encoding {len(queries)} queries via embedding service...")
-    vecs = inference_client.encode(queries, normalize=True)
+    vecs = query_vectors
 
     for qid, qvec in tqdm(zip(qids, vecs), total=len(qids), desc="HNSW retrieval"):
         preds[qid] = inference_client.ranked_ids_hnsw(
-            query="",           # unused — pre-computed vector is passed directly
+            query="",
             vector=qvec,
             k=topn,
             filter_source=filter_source,
@@ -101,17 +95,14 @@ def retrieve_hybrid_rrf(
     query_table: pd.DataFrame,
     topn: int,
     filter_source: Optional[str] = None,
-    encode_batch_size: int = 64,
     candidate_pool_size: int = 20,
     rrf_k: int = 60,
+    query_vectors: Optional[list] = None,
 ) -> PredictedRankings:
     preds: PredictedRankings = {}
-
     qids = query_table["query_id"].astype(str).tolist()
     queries = query_table["query"].astype(str).tolist()
-
-    print(f"[Hybrid RRF] Batch-encoding {len(queries)} queries via embedding service...")
-    vecs = inference_client.encode(queries, normalize=True)
+    vecs = query_vectors
 
     for qid, query, qvec in tqdm(zip(qids, queries, vecs), total=len(qids), desc="Hybrid RRF retrieval"):
         preds[qid] = inference_client.ranked_ids_hybrid_rrf(
@@ -131,16 +122,13 @@ def retrieve_hybrid_rerank(
     query_table: pd.DataFrame,
     topn: int,
     filter_source: Optional[str] = None,
-    encode_batch_size: int = 64,
     candidate_pool_size: int = 20,
+    query_vectors: Optional[list] = None,
 ) -> PredictedRankings:
     preds: PredictedRankings = {}
-
     qids = query_table["query_id"].astype(str).tolist()
     queries = query_table["query"].astype(str).tolist()
-
-    print(f"[Hybrid Rerank] Batch-encoding {len(queries)} queries via embedding service...")
-    vecs = inference_client.encode(queries, normalize=True)
+    vecs = query_vectors
 
     for qid, query, qvec in tqdm(zip(qids, queries, vecs), total=len(qids), desc="Hybrid Rerank retrieval"):
         preds[qid] = inference_client.ranked_ids_hybrid_rerank(
@@ -219,6 +207,16 @@ def main() -> None:
         opensearch_timeout=args.timeout,
     )
 
+    # Encode all queries once and reuse across HNSW, Hybrid RRF, and Hybrid Rerank.
+    # BM25 is lexical-only and never needs vectors.
+    needs_vectors = not (args.skip_hnsw and args.skip_hybrid_rrf and args.skip_hybrid_rerank)
+    query_vectors = None
+    if needs_vectors:
+        queries = test_queries["query"].astype(str).tolist()
+        print(f"\n[Encode] Batch-encoding {len(queries)} queries via embedding service (once, shared across HNSW / Hybrid)...")
+        query_vectors = inference.encode(queries, normalize=True)
+        print(f"[Encode] Done — {len(query_vectors)} vectors cached.")
+
     # ── BM25 ─────────────────────────────────────────────────────────────────
     if not args.skip_bm25:
         print(f"\n[BM25] top-{args.topn} | index={args.bm25_index} | filter={filter_source}")
@@ -246,7 +244,7 @@ def main() -> None:
             query_table=test_queries,
             topn=args.topn,
             filter_source=filter_source,
-            encode_batch_size=args.encode_batch_size,
+            query_vectors=query_vectors,
         )
         save_json(out_dir / "hnsw_ranked.json", hnsw_ranked)
         scores = evaluator.evaluate_rankings(
@@ -266,9 +264,9 @@ def main() -> None:
             query_table=test_queries,
             topn=args.topn,
             filter_source=filter_source,
-            encode_batch_size=args.encode_batch_size,
             candidate_pool_size=args.candidate_pool_size,
             rrf_k=args.rrf_k,
+            query_vectors=query_vectors,
         )
         save_json(out_dir / "hybrid_rrf_ranked.json", hybrid_rrf_ranked)
         scores = evaluator.evaluate_rankings(
@@ -288,8 +286,8 @@ def main() -> None:
             query_table=test_queries,
             topn=args.topn,
             filter_source=filter_source,
-            encode_batch_size=args.encode_batch_size,
             candidate_pool_size=args.candidate_pool_size,
+            query_vectors=query_vectors,
         )
         save_json(out_dir / "hybrid_rerank_ranked.json", hybrid_rerank_ranked)
         scores = evaluator.evaluate_rankings(

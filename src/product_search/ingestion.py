@@ -17,6 +17,7 @@ the API used by database_ingestion.ipynb; new code should use the classes direct
 import argparse
 import json
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -64,10 +65,22 @@ class DocumentBuilder:
 
     @staticmethod
     def _base(pid: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        raw = meta.get("metadata", {}) or {}
+        # Normalise bullets: collapse pipe/newline delimiters used by ESCI
+        bullets_raw = raw.get("product_bullet_point")
+        bullets = re.sub(r"[\|\n\r]+", " ", str(bullets_raw)).strip() if bullets_raw else None
         return {
             "product_id":     pid,
             "source":         meta.get("source", ""),
+            # Per-field text columns for multi_match boosting
+            "title":          raw.get("product_title") or raw.get("product_name"),
+            "brand_text":     raw.get("product_brand"),
+            "bullets":        bullets,
+            "description":    raw.get("product_description"),
+            # Full concatenation kept for display; encode_text used for dense embeddings
             "full_text":      meta.get("full_text", ""),
+            "encode_text":    meta.get("encode_text", ""),
+            # Keyword / numeric filter fields
             "brand":          meta.get("brand"),
             "color":          meta.get("color", []),
             "product_class":  meta.get("product_class"),
@@ -129,6 +142,10 @@ class BM25Indexer(BaseIndexer):
         "properties": {
             "product_id":     {"type": "keyword"},
             "source":         {"type": "keyword"},
+            "title":          {"type": "text"},
+            "brand_text":     {"type": "text"},
+            "bullets":        {"type": "text"},
+            "description":    {"type": "text"},
             "full_text":      {"type": "text"},
             "brand":          {"type": "keyword"},
             "color":          {"type": "keyword"},
@@ -238,6 +255,7 @@ class HNSWIndexer(BaseIndexer):
                     "product_id":     {"type": "keyword"},
                     "source":         {"type": "keyword"},
                     "full_text":      {"type": "text"},
+                    "encode_text":    {"type": "text"},
                     "brand":          {"type": "keyword"},
                     "color":          {"type": "keyword"},
                     "product_class":  {"type": "keyword"},
@@ -276,7 +294,7 @@ class HNSWIndexer(BaseIndexer):
         with tqdm(total=len(product_ids), desc=f"HNSW ingest → {self.index_name}", unit="docs") as pbar:
             for chunk in _batched(product_ids, self._batch_size):
                 valid: List[Tuple[str, str, Dict[str, Any]]] = [
-                    (pid, meta.get("full_text", ""), meta)
+                    (pid, meta.get("encode_text") or meta.get("full_text", ""), meta)
                     for pid in chunk
                     if (meta := product_store.get(pid)) is not None
                 ]
@@ -394,6 +412,7 @@ def main() -> None:
     ap.add_argument("--verify-certs",     action="store_true", default=False)
     ap.add_argument("--timeout",          type=int, default=int(os.getenv("OPENSEARCH_TIMEOUT", "60")))
     ap.add_argument("--train-qrels",      required=True, help="Path to train_qrels.json")
+    ap.add_argument("--test-qrels",       default=None,  help="Path to test_qrels.json (optional — ensures test-relevant products are indexed)")
     ap.add_argument("--product-store",    required=True, help="Path to product_store.json")
     ap.add_argument("--bm25-index",       default=os.getenv("OPENSEARCH_BM25_INDEX", "products_bm25"))
     ap.add_argument("--hnsw-index",       default=os.getenv("OPENSEARCH_HNSW_INDEX", "products_hnsw"))
@@ -421,7 +440,14 @@ def main() -> None:
     with open(args.train_qrels, encoding="utf-8") as f:
         train_qrels: Dict[str, Dict[str, float]] = json.load(f)
 
-    product_ids = sorted({pid for gains in train_qrels.values() for pid in gains})
+    all_qrels = dict(train_qrels)
+    if args.test_qrels:
+        with open(args.test_qrels, encoding="utf-8") as f:
+            test_qrels: Dict[str, Dict[str, float]] = json.load(f)
+        all_qrels.update(test_qrels)
+        print(f"[INFO] Merging train + test qrels: {len(train_qrels)} + {len(test_qrels)} queries")
+
+    product_ids = sorted({pid for gains in all_qrels.values() for pid in gains})
     missing = [pid for pid in product_ids if pid not in product_store]
     if missing:
         print(f"[WARN] {len(missing)} product_ids from qrels missing in product_store. Examples: {missing[:5]}")
@@ -444,10 +470,11 @@ def main() -> None:
         emb_url = args.embedding_service_url
         if emb_url:
             print(f"[INFO] Using Cloud Run embedding service: {emb_url}")
+            print(f"[INFO] Probing embedding service (may take up to 120s on cold start)...")
             probe = requests.post(
                 f"{emb_url.rstrip('/')}/encode",
                 json={"texts": ["probe"], "normalize": True},
-                timeout=30,
+                timeout=120,
             )
             probe.raise_for_status()
             dim = len(probe.json()["embeddings"][0])
@@ -457,7 +484,7 @@ def main() -> None:
             embedder, device = load_embedder(args.model)
             print(f"[INFO] SentenceTransformer device = {device}")
             dim = int(embedder.get_sentence_embedding_dimension())
-        config = HNSWConfig(dim=dim, vector_field=args.vector_field, engine="nmslib")
+        config = HNSWConfig(dim=dim, vector_field=args.vector_field, engine="faiss")
         hnsw = HNSWIndexer(
             args.hnsw_index, config=config, embedder=embedder,
             embedding_service_url=emb_url,

@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,7 @@ class SearchHit(BaseModel):
     product_id: Optional[str]
     score: float
     full_text: str
+    encode_text: str = ""
     source: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -172,16 +174,56 @@ class OpenSearchInference:
 
     # ── OpenSearch query builders ─────────────────────────────────────────────
 
+    # Ordered list of lead-in phrases to strip from the query start.
+    # Longer / more-specific phrases must come first.
+    _LEADIN_PHRASES: List[str] = [
+        r"i(?:'d|'m)?\s+(?:would\s+)?love\s+to\s+(?:find|buy|get|check\s+out|look\s+at|see)",
+        r"i(?:'d|'m)?\s+(?:would\s+)?love\s+(?:to\s+)?(?:find|buy|get|some|a|an)?",
+        r"i(?:'m)?\s+(?:am\s+)?looking\s+for\s+(?:a|an|some)?",
+        r"i\s+(?:want|need|would\s+like)\s+(?:to\s+(?:find|buy|get)\s+)?(?:a|an|some)?",
+        r"(?:can\s+you\s+)?(?:show|find|get|give|help\s+me\s+find)\s+me\s+(?:a|an|some)?",
+        r"(?:looking|searching|hunting|shopping)\s+for\s+(?:a|an|some)?",
+        r"(?:please|hey|hi|hello)\s+",
+    ]
+    _LEADIN_PATTERN = re.compile(
+        r"^\s*(?:" + "|".join(_LEADIN_PHRASES) + r")\s*",
+        re.IGNORECASE,
+    )
+    # Low-signal adjectives that add noise without product specificity.
+    _FILLER_WORDS_PATTERN = re.compile(
+        r"\b(?:some|cool|nice|good|great|awesome|amazing)\b\s*",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _clean_query(cls, query: str) -> str:
+        """Strip conversational filler so BM25 matches product terms only."""
+        q = cls._LEADIN_PATTERN.sub("", query).strip()
+        q = cls._FILLER_WORDS_PATTERN.sub(" ", q).strip()
+        return q if len(q) >= 2 else query
+
     @staticmethod
     def bm25_query_body(query: str, k: int, filter_source: Optional[str]) -> Dict[str, Any]:
         """
-        Matches against full_text, which is the enriched text field written by
-        DocumentBuilder.for_bm25() during ingestion. It concatenates title, brand,
-        bullets/features, and description — so a single match here covers all signals.
+        Multi-field BM25 query with per-field boost weights.
+
+        Title and brand_text carry the highest signal for product identity.
+        Bullets cover attribute queries (color, material, size).
+        Description is heavily down-weighted to prevent noisy marketing copy
+        and quoted customer reviews from surfacing irrelevant products.
+        Query is pre-cleaned to strip conversational filler before BM25 scoring.
         """
+        cleaned = OpenSearchInference._clean_query(query)
         must_clause: Dict[str, Any] = {
-            "match": {
-                "full_text": {"query": query},
+            "multi_match": {
+                "query":  cleaned,
+                "fields": [
+                    "title^5",
+                    "brand_text^4",
+                    "bullets^2",
+                    "description^0.3",
+                ],
+                "type": "best_fields",
             }
         }
 
@@ -278,6 +320,7 @@ class OpenSearchInference:
                     source=src.get("source"),
                     metadata=src.get("metadata") or {},
                     full_text=src.get("full_text") if include_full_text else "",
+                    encode_text=src.get("encode_text", ""),
                 )
             )
         return hits
@@ -316,6 +359,7 @@ class OpenSearchInference:
                     source=src.get("source"),
                     metadata=src.get("metadata") or {},
                     full_text=src.get("full_text") if include_full_text else "",
+                    encode_text=src.get("encode_text", ""),
                 )
             )
         return hits
@@ -329,7 +373,7 @@ class OpenSearchInference:
         *,
         k: int = 10,
         filter_source: Optional[str] = None,
-        candidate_pool_size: int = 20,
+        candidate_pool_size: int = 50,
         include_full_text: bool = False,
         rrf_k: int = 60,
     ) -> List[SearchHit]:
@@ -380,6 +424,7 @@ class OpenSearchInference:
                         source=base.source,
                         metadata=base.metadata,
                         full_text=base.full_text if include_full_text else "",
+                        encode_text=base.encode_text,
                     )
                 )
         return out
@@ -393,7 +438,7 @@ class OpenSearchInference:
         *,
         k: int = 10,
         filter_source: Optional[str] = None,
-        candidate_pool_size: int = 20,
+        candidate_pool_size: int = 50,
         include_full_text: bool = True,
     ) -> List[SearchHit]:
         """
@@ -431,7 +476,7 @@ class OpenSearchInference:
         if not candidates:
             return []
 
-        texts = [h.full_text for h in candidates]
+        texts = [h.encode_text or h.full_text for h in candidates]
         scores = self._rerank_scores(query, texts)
 
         scored = sorted(zip(candidates, scores), key=lambda x: float(x[1]), reverse=True)
@@ -445,6 +490,7 @@ class OpenSearchInference:
                     source=hit.source,
                     metadata=hit.metadata,
                     full_text=hit.full_text if include_full_text else "",
+                    encode_text=hit.encode_text,
                 )
             )
         return out[:k]
@@ -479,7 +525,7 @@ class OpenSearchInference:
         *,
         k: int = 10,
         filter_source: Optional[str] = None,
-        candidate_pool_size: int = 20,
+        candidate_pool_size: int = 50,
         rrf_k: int = 60,
     ) -> List[str]:
         hits = self.query_hybrid_rrf(
@@ -504,7 +550,7 @@ class OpenSearchInference:
         *,
         k: int = 10,
         filter_source: Optional[str] = None,
-        candidate_pool_size: int = 20,
+        candidate_pool_size: int = 50,
     ) -> List[str]:
         hits = self.query_hybrid_rerank(
             query=query,

@@ -36,8 +36,8 @@ with st.sidebar:
 
     if search_type == "hybrid_rerank":
         st.info(
-            "**Cross-encoder reranking** scores every candidate with `BAAI/bge-reranker-v2-m3` "
-            "running on CPU. Expect **30–90 s** per query depending on candidate pool size.",
+            "**Cross-encoder reranking** scores every candidate with `BAAI/bge-reranker-v2-m3`. "
+            "First request may be slow if the service is cold.",
             icon="⏳",
         )
 
@@ -94,9 +94,9 @@ if search_clicked and query.strip():
         timeout = 15
 
     if search_type == "hybrid_rerank":
-        with st.status("Reranking in progress — this can take up to 90 s on CPU…", expanded=True) as status:
+        with st.status("Reranking in progress…", expanded=True) as status:
             st.write("Retrieving BM25 and HNSW candidates…")
-            st.write("Running cross-encoder reranking on CPU (please wait)…")
+            st.write("Running cross-encoder reranking…")
             try:
                 resp = requests.post(
                     f"{API_BASE_URL}/search/{search_type}",

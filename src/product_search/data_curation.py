@@ -72,7 +72,8 @@ class ProductDocument:
     """
     product_id: str
     source: str                         # "ESCI" | "WANDS"
-    full_text: str                      # enriched text for retrieval
+    full_text: str                      # enriched text for BM25 (title+brand+bullets+description)
+    encode_text: str                    # short text for dense embedding (title+brand only)
     brand: Optional[str]                # keyword filter
     color: List[str]                    # list of normalised colour tokens
     product_class: Optional[str]        # high-level category keyword
@@ -87,6 +88,7 @@ class ProductDocument:
             "product_id":     self.product_id,
             "source":         self.source,
             "full_text":      self.full_text,
+            "encode_text":    self.encode_text,
             "brand":          self.brand,
             "color":          self.color,
             "product_class":  self.product_class,
@@ -318,13 +320,8 @@ class FullTextBuilder:
     @staticmethod
     def build_from_esci(meta: Dict[str, Any]) -> str:
         """
-        ESCI-specific full_text construction.
-
-        Field priority:
-          title > brand > bullet_points > description
+        ESCI full_text for BM25: title > brand > bullet_points > description.
         """
-        # Bullet points come as a single string with \n or pipe delimiters.
-        # Replace separators with spaces so BM25 tokenises them correctly.
         bullets_raw = meta.get("product_bullet_point")
         bullets = re.sub(r"[\|\n\r]+", " ", str(bullets_raw)).strip() if bullets_raw else ""
 
@@ -338,12 +335,8 @@ class FullTextBuilder:
     @staticmethod
     def build_from_wands(meta: Dict[str, Any], parsed_features: Dict[str, str]) -> str:
         """
-        WANDS-specific full_text construction.
-
-        Field priority:
-          product_name > product_class > category > feature_values > description
+        WANDS full_text for BM25: name > class > category > features > description.
         """
-        # Use parsed feature values (not keys) for BM25 signal
         feature_text = " ".join(parsed_features.values()) if parsed_features else ""
 
         return FullTextBuilder.build([
@@ -352,6 +345,32 @@ class FullTextBuilder:
             ("category",     meta.get("category hierarchy")),
             ("features",     feature_text or None),
             ("description",  meta.get("product_description")),
+        ])
+
+    @staticmethod
+    def encode_text_from_esci(meta: Dict[str, Any], colors: Optional[List[str]] = None) -> str:
+        """
+        Short text for dense embedding (ESCI): title + brand + color tokens.
+        Color is appended so color-specific queries (e.g. "teal tutu") can
+        match even when the color word isn't in the product title.
+        """
+        color_str = " ".join(colors) if colors else None
+        return FullTextBuilder.build([
+            ("title", meta.get("product_title")),
+            ("brand", meta.get("product_brand")),
+            ("color", color_str),
+        ])
+
+    @staticmethod
+    def encode_text_from_wands(meta: Dict[str, Any], colors: Optional[List[str]] = None) -> str:
+        """
+        Short text for dense embedding (WANDS): name + class + color tokens.
+        """
+        color_str = " ".join(colors) if colors else None
+        return FullTextBuilder.build([
+            ("name",  meta.get("product_name")),
+            ("class", meta.get("product_class")),
+            ("color", color_str),
         ])
 
 
@@ -587,12 +606,14 @@ class ESCIProcessor(DatasetProcessor):
                     for c in meta_cols}
 
             pid = self._prefix_id(row.product_id)
+            colors = AttributeNormalizer.normalize_color(meta.get("product_color"))
             doc = ProductDocument(
                 product_id=pid,
                 source=self.SOURCE_NAME,
                 full_text=FullTextBuilder.build_from_esci(meta),
+                encode_text=FullTextBuilder.encode_text_from_esci(meta, colors),
                 brand=AttributeNormalizer.normalize_brand(meta.get("product_brand")),
-                color=AttributeNormalizer.normalize_color(meta.get("product_color")),
+                color=colors,
                 product_class=None,           # ESCI has no product class field
                 category_path=None,           # ESCI has no category hierarchy
                 average_rating=None,          # ESCI has no rating in small version
@@ -731,6 +752,7 @@ class WANDSProcessor(DatasetProcessor):
                 product_id=pid,
                 source=self.SOURCE_NAME,
                 full_text=FullTextBuilder.build_from_wands(raw_meta, parsed_features),
+                encode_text=FullTextBuilder.encode_text_from_wands(raw_meta, colors),
                 brand=None,                   # WANDS has no brand field
                 color=colors,
                 product_class=AttributeNormalizer.normalize_str(

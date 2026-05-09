@@ -127,6 +127,7 @@ def search_hybrid(req: SearchRequest) -> SearchResponse:
             query=req.query,
             k=req.k,
             filter_source=req.filter_source,
+            candidate_pool_size=50,
             include_full_text=True,
         )
     except Exception as e:
@@ -147,6 +148,7 @@ def search_hybrid_rerank(req: SearchRequest) -> SearchResponse:
             query=req.query,
             k=req.k,
             filter_source=req.filter_source,
+            candidate_pool_size=25,
             include_full_text=True,
         )
     except Exception as e:
