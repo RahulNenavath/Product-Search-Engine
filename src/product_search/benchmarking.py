@@ -141,6 +141,32 @@ def retrieve_hybrid_rerank(
     return preds
 
 
+def retrieve_agentic(
+    inference_client: OpenSearchInference,
+    *,
+    query_table: pd.DataFrame,
+    topn: int,
+    filter_source: Optional[str] = None,
+    limit_queries: Optional[int] = None,
+) -> PredictedRankings:
+    from product_search.agent.graph import run_agent  # lazy import
+
+    rows = list(query_table.itertuples(index=False))
+    if limit_queries:
+        rows = rows[:limit_queries]
+
+    preds: PredictedRankings = {}
+    for row in tqdm(rows, total=len(rows), desc="Agentic retrieval"):
+        hits, _ = run_agent(
+            query=str(row.query),
+            k=topn,
+            inference=inference_client,
+            filter_source=filter_source,
+        )
+        preds[str(row.query_id)] = [h.product_id for h in hits if h.product_id]
+    return preds
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -179,6 +205,9 @@ def main() -> None:
     ap.add_argument("--skip-hnsw", action="store_true", default=False)
     ap.add_argument("--skip-hybrid-rrf", action="store_true", default=False)
     ap.add_argument("--skip-hybrid-rerank", action="store_true", default=False)
+    ap.add_argument("--skip-agentic", action="store_true", default=False)
+    ap.add_argument("--limit-queries", type=int, default=None,
+                    help="Cap number of queries for agentic retrieval (e.g. 50 for quick checks).")
     ap.add_argument("--out-dir", default="./runs")
 
     args = ap.parse_args()
@@ -297,6 +326,27 @@ def main() -> None:
         )
         scores.to_csv(out_dir / "hybrid_rerank_metrics.csv", index=False)
         print("\n[Hybrid Rerank] Metrics")
+        print(scores.to_string(index=False))
+
+    # ── Agentic ───────────────────────────────────────────────────────────────
+    if not args.skip_agentic:
+        n_label = f"first {args.limit_queries}" if args.limit_queries else "all"
+        print(f"\n[Agentic] top-{args.topn} | candidate_pool=25 (initial) | queries={n_label}")
+        agentic_ranked = retrieve_agentic(
+            inference,
+            query_table=test_queries,
+            topn=args.topn,
+            filter_source=filter_source,
+            limit_queries=args.limit_queries,
+        )
+        save_json(out_dir / "agentic_ranked.json", agentic_ranked)
+        scores = evaluator.evaluate_rankings(
+            ground_truth_qrels=gt_qrels_raw,
+            predicted_rankings=agentic_ranked,
+            binary_threshold=args.binary_threshold,
+        )
+        scores.to_csv(out_dir / "agentic_metrics.csv", index=False)
+        print("\n[Agentic] Metrics")
         print(scores.to_string(index=False))
 
     print(f"\n[DONE] Outputs saved to: {out_dir.resolve()}")

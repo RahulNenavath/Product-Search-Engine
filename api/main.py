@@ -39,6 +39,17 @@ from search_pipeline import (
     SearchResponse,
 )
 
+# Lazy import — avoids pulling in LangChain/VertexAI at startup if unused.
+# The agent module is only loaded on the first /search/agentic request.
+_run_agent = None
+
+def _get_run_agent():
+    global _run_agent
+    if _run_agent is None:
+        from product_search.agent.graph import run_agent as _ra  # type: ignore
+        _run_agent = _ra
+    return _run_agent
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -133,6 +144,27 @@ def search_hybrid(req: SearchRequest) -> SearchResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hybrid search failed: {e}")
     return SearchResponse(index="hybrid_rrf", query=req.query, k=req.k, hits=hits)
+
+
+@app.post("/search/agentic", response_model=SearchResponse)
+def search_agentic(req: SearchRequest) -> SearchResponse:
+    """Agentic search: Gemini Flash rewrites the query, then runs hybrid_rerank.
+
+    The agent optionally reassesses results and retries with a wider candidate
+    pool or by decomposing multi-constraint queries (max 2 iterations).
+    Latency is higher than /search/hybrid_rerank due to LLM calls.
+    """
+    try:
+        run_agent = _get_run_agent()
+        hits, rewritten_query = run_agent(
+            query=req.query,
+            k=req.k,
+            inference=inference,
+            filter_source=req.filter_source,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agentic search failed: {e}")
+    return SearchResponse(index="agentic", query=req.query, k=req.k, hits=hits, rewritten_query=rewritten_query)
 
 
 @app.post("/search/hybrid_rerank", response_model=SearchResponse)

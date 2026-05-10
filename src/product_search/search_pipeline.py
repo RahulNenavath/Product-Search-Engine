@@ -30,6 +30,7 @@ class SearchResponse(BaseModel):
     query: str
     k: int
     hits: List[SearchHit]
+    rewritten_query: Optional[str] = None
 
 
 class EmbeddingServiceError(RuntimeError):

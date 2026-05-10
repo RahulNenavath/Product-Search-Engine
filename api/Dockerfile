@@ -14,8 +14,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY api/main.py .
 
-# search_pipeline.py lives in src/product_search/ but is copied flat into /app
-# so that `from search_pipeline import ...` resolves at runtime.
+# Copy the full product_search package so `from product_search.agent.graph import ...` resolves.
+COPY src/product_search/ ./product_search/
+
+# Also copy search_pipeline.py flat into /app for the existing `from search_pipeline import ...` import.
 COPY src/product_search/search_pipeline.py .
 
 EXPOSE 8000

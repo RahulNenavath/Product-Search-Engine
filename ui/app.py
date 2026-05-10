@@ -24,20 +24,28 @@ with st.sidebar:
 
     search_type = st.radio(
         "Search mode",
-        options=["hybrid", "bm25", "hnsw", "hybrid_rerank"],
+        options=["hybrid", "bm25", "hnsw", "hybrid_rerank", "agentic"],
         format_func=lambda x: {
-            "hybrid": "🔀 Hybrid (BM25 + HNSW)",
-            "bm25": "📝 BM25 (Keyword)",
-            "hnsw": "🧠 HNSW (Semantic)",
-            "hybrid_rerank": "🏆 Hybrid + Reranker (best quality)",
+            "hybrid":        "🔀 Hybrid (BM25 + HNSW)",
+            "bm25":          "📝 BM25 (Keyword)",
+            "hnsw":          "🧠 HNSW (Semantic)",
+            "hybrid_rerank": "🏆 Hybrid + Reranker",
+            "agentic":       "🤖 Agentic (Gemini Flash)",
         }[x],
         index=0,
     )
 
-    if search_type == "hybrid_rerank":
+    if search_type == "agentic":
+        st.info(
+            "**Gemini Flash** rewrites and normalizes your query before retrieval, "
+            "then assesses result quality and may retry with a wider candidate pool. "
+            "Expect **5–15 s** per search.",
+            icon="🤖",
+        )
+    elif search_type == "hybrid_rerank":
         st.info(
             "**Cross-encoder reranking** scores every candidate with `BAAI/bge-reranker-v2-m3`. "
-            "First request may be slow if the service is cold.",
+            "First request may be slow if the embedding service is cold.",
             icon="⏳",
         )
 
@@ -68,7 +76,9 @@ with st.sidebar:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 st.title("🔍 Product Search")
-st.caption("Powered by OpenSearch · BM25 · HNSW · Hybrid RRF · Cross-encoder Reranking")
+
+caption_suffix = " · Gemini Flash Agent" if search_type == "agentic" else ""
+st.caption(f"Powered by OpenSearch · BM25 · HNSW · Hybrid RRF · Cross-encoder Reranking{caption_suffix}")
 
 query = st.text_input(
     label="Search query",
@@ -86,14 +96,49 @@ if search_clicked and query.strip():
     if source_filter != "All":
         payload["filter_source"] = source_filter
 
-    if search_type == "hybrid_rerank":
+    # Timeout budget per mode
+    if search_type in ("agentic", "hybrid_rerank"):
         timeout = 300
     elif search_type in ("hnsw", "hybrid"):
-        timeout = 120  # Cloud Run cold-start can take 30-90s
+        timeout = 120   # Cloud Run cold-start can take 30-90 s
     else:
         timeout = 15
 
-    if search_type == "hybrid_rerank":
+    # ── Agentic ──────────────────────────────────────────────────────────────
+    if search_type == "agentic":
+        with st.status("🤖 Agentic search in progress…", expanded=True) as status:
+            st.write("🔍 Analyzing query intent…")
+            st.write("✏️ Rewriting and normalizing query with Gemini Flash…")
+            st.write("🔗 Retrieving candidates (BM25 + HNSW)…")
+            st.write("🏆 Cross-encoder reranking…")
+            st.write("✅ Assessing result quality…")
+            try:
+                resp = requests.post(
+                    f"{API_BASE_URL}/search/agentic",
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                status.update(label="🤖 Agentic search complete!", state="complete", expanded=False)
+            except requests.exceptions.HTTPError as e:
+                status.update(label="Agentic search failed", state="error", expanded=False)
+                st.error(f"Search failed ({e.response.status_code}): {e.response.text}")
+                st.stop()
+            except requests.exceptions.Timeout:
+                status.update(label="Request timed out", state="error", expanded=False)
+                st.error(
+                    "The agentic search timed out after 300 s. "
+                    "This usually means the embedding service or Vertex AI is cold — try again in a moment."
+                )
+                st.stop()
+            except Exception as e:
+                status.update(label="Request error", state="error", expanded=False)
+                st.error(f"Request error: {e}")
+                st.stop()
+
+    # ── Hybrid + Reranker ─────────────────────────────────────────────────────
+    elif search_type == "hybrid_rerank":
         with st.status("Reranking in progress…", expanded=True) as status:
             st.write("Retrieving BM25 and HNSW candidates…")
             st.write("Running cross-encoder reranking…")
@@ -114,8 +159,16 @@ if search_clicked and query.strip():
                 status.update(label="Request error", state="error", expanded=False)
                 st.error(f"Request error: {e}")
                 st.stop()
+
+    # ── BM25 / HNSW / Hybrid ─────────────────────────────────────────────────
     else:
-        with st.spinner(f"Searching via {search_type.upper()}… (first request may take up to 90 s if the embedding service is cold)" if search_type in ("hnsw", "hybrid") else f"Searching via {search_type.upper()}…"):
+        spinner_msg = (
+            f"Searching via {search_type.upper()}… "
+            "(first request may take up to 90 s if the embedding service is cold)"
+            if search_type in ("hnsw", "hybrid")
+            else f"Searching via {search_type.upper()}…"
+        )
+        with st.spinner(spinner_msg):
             try:
                 resp = requests.post(
                     f"{API_BASE_URL}/search/{search_type}",
@@ -136,8 +189,21 @@ if search_clicked and query.strip():
     # ── Summary bar ───────────────────────────────────────────────────────────
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Results", len(hits))
-    col_b.metric("Mode", search_type.upper())
+    col_b.metric("Mode", {
+        "bm25":          "BM25",
+        "hnsw":          "HNSW",
+        "hybrid":        "Hybrid RRF",
+        "hybrid_rerank": "Hybrid + Rerank",
+        "agentic":       "Agentic",
+    }.get(search_type, search_type.upper()))
     col_c.metric("Index", data.get("index", "—"))
+
+    if search_type == "agentic":
+        rewritten = data.get("rewritten_query") or ""
+        if rewritten and rewritten.strip().lower() != query.strip().lower():
+            st.info(f"**Rewritten query:** {rewritten}", icon="✏️")
+        else:
+            st.caption("Query was used as-is (no rewrite needed).")
 
     st.divider()
 
@@ -146,12 +212,11 @@ if search_clicked and query.strip():
     else:
         for rank, hit in enumerate(hits, start=1):
             product_id = hit.get("product_id") or "—"
-            score = hit.get("score", 0.0)
-            source = hit.get("source") or "—"
-            full_text = hit.get("full_text") or ""
-            metadata = hit.get("metadata") or {}
+            score      = hit.get("score", 0.0)
+            source     = hit.get("source") or "—"
+            full_text  = hit.get("full_text") or ""
+            metadata   = hit.get("metadata") or {}
 
-            # Source badge colour
             badge = {"ESCI": "🟠", "WANDS": "🔵"}.get(source, "⚪")
 
             with st.expander(

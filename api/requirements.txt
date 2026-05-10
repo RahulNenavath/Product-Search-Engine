@@ -6,3 +6,10 @@ pydantic==2.10.4
 # All embedding and reranking is handled by the remote Cloud Run embedding service.
 # requests is used for HTTP calls to the embedding service and comes as a
 # transitive dependency of opensearch-py — no explicit pin needed.
+
+# LangChain / LangGraph — required by the agentic search endpoint (/search/agentic).
+# No ML models are loaded; these are orchestration + Vertex AI HTTP client packages only.
+langchain-google-genai>=2.1.0
+langchain-core==1.2.18
+langgraph==1.1.1
+langsmith==0.7.16
