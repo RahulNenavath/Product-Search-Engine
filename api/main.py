@@ -167,6 +167,27 @@ def search_agentic(req: SearchRequest) -> SearchResponse:
     return SearchResponse(index="agentic", query=req.query, k=req.k, hits=hits, rewritten_query=rewritten_query)
 
 
+@app.post("/search/hybrid_llm_rerank", response_model=SearchResponse)
+def search_hybrid_llm_rerank(req: SearchRequest) -> SearchResponse:
+    """Hybrid BM25 + HNSW retrieval re-ranked by Gemini Flash-lite permutation ranking.
+
+    The LLM sees all candidates (pool=25) in one prompt and outputs a ranked
+    permutation. Benchmarked at NDCG@5 = 0.730 (+7.0% vs cross-encoder baseline).
+    Latency: ~3-5 s per query.
+    """
+    try:
+        hits = inference.query_hybrid_llm_rerank(
+            query=req.query,
+            k=req.k,
+            filter_source=req.filter_source,
+            candidate_pool_size=25,
+            include_full_text=True,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hybrid LLM rerank search failed: {e}")
+    return SearchResponse(index="hybrid_llm_rerank", query=req.query, k=req.k, hits=hits)
+
+
 @app.post("/search/hybrid_rerank", response_model=SearchResponse)
 def search_hybrid_rerank(req: SearchRequest) -> SearchResponse:
     """Hybrid BM25 + HNSW retrieval followed by cross-encoder reranking.

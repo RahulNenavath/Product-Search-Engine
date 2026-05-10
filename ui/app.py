@@ -24,18 +24,26 @@ with st.sidebar:
 
     search_type = st.radio(
         "Search mode",
-        options=["hybrid", "bm25", "hnsw", "hybrid_rerank", "agentic"],
+        options=["hybrid_llm_rerank", "hybrid_rerank", "hybrid", "bm25", "hnsw", "agentic"],
         format_func=lambda x: {
-            "hybrid":        "🔀 Hybrid (BM25 + HNSW)",
-            "bm25":          "📝 BM25 (Keyword)",
-            "hnsw":          "🧠 HNSW (Semantic)",
-            "hybrid_rerank": "🏆 Hybrid + Reranker",
-            "agentic":       "🤖 Agentic (Gemini Flash)",
+            "hybrid":            "🔀 Hybrid (BM25 + HNSW)",
+            "bm25":              "📝 BM25 (Keyword)",
+            "hnsw":              "🧠 HNSW (Semantic)",
+            "hybrid_rerank":     "🏆 Hybrid + Cross-encoder",
+            "hybrid_llm_rerank": "✨ Hybrid + LLM Reranker",
+            "agentic":           "🤖 Agentic (Gemini Flash)",
         }[x],
         index=0,
     )
 
-    if search_type == "agentic":
+    if search_type == "hybrid_llm_rerank":
+        st.info(
+            "**Best overall quality** — NDCG@5 = 0.730 (+7% vs cross-encoder). "
+            "Gemini Flash-lite ranks all 25 candidates by relevance in a single prompt. "
+            "Expect **3–5 s** per search.",
+            icon="✨",
+        )
+    elif search_type == "agentic":
         st.info(
             "**Gemini Flash** rewrites and normalizes your query before retrieval, "
             "then assesses result quality and may retry with a wider candidate pool. "
@@ -77,7 +85,12 @@ with st.sidebar:
 
 st.title("🔍 Product Search")
 
-caption_suffix = " · Gemini Flash Agent" if search_type == "agentic" else ""
+if search_type == "agentic":
+    caption_suffix = " · Gemini Flash Agent"
+elif search_type == "hybrid_llm_rerank":
+    caption_suffix = " · Gemini Flash-lite LLM Reranker"
+else:
+    caption_suffix = ""
 st.caption(f"Powered by OpenSearch · BM25 · HNSW · Hybrid RRF · Cross-encoder Reranking{caption_suffix}")
 
 query = st.text_input(
@@ -97,8 +110,10 @@ if search_clicked and query.strip():
         payload["filter_source"] = source_filter
 
     # Timeout budget per mode
-    if search_type in ("agentic", "hybrid_rerank"):
+    if search_type == "agentic":
         timeout = 300
+    elif search_type in ("hybrid_rerank", "hybrid_llm_rerank"):
+        timeout = 60
     elif search_type in ("hnsw", "hybrid"):
         timeout = 120   # Cloud Run cold-start can take 30-90 s
     else:
@@ -137,7 +152,30 @@ if search_clicked and query.strip():
                 st.error(f"Request error: {e}")
                 st.stop()
 
-    # ── Hybrid + Reranker ─────────────────────────────────────────────────────
+    # ── Hybrid + LLM Reranker ────────────────────────────────────────────────
+    elif search_type == "hybrid_llm_rerank":
+        with st.status("LLM reranking in progress…", expanded=True) as status:
+            st.write("Retrieving BM25 and HNSW candidates…")
+            st.write("Ranking with Gemini Flash-lite permutation reranker…")
+            try:
+                resp = requests.post(
+                    f"{API_BASE_URL}/search/hybrid_llm_rerank",
+                    json=payload,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                status.update(label="LLM reranking complete!", state="complete", expanded=False)
+            except requests.exceptions.HTTPError as e:
+                status.update(label="Search failed", state="error", expanded=False)
+                st.error(f"Search failed ({e.response.status_code}): {e.response.text}")
+                st.stop()
+            except Exception as e:
+                status.update(label="Request error", state="error", expanded=False)
+                st.error(f"Request error: {e}")
+                st.stop()
+
+    # ── Hybrid + Cross-Encoder ───────────────────────────────────────────────
     elif search_type == "hybrid_rerank":
         with st.status("Reranking in progress…", expanded=True) as status:
             st.write("Retrieving BM25 and HNSW candidates…")
@@ -190,11 +228,12 @@ if search_clicked and query.strip():
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Results", len(hits))
     col_b.metric("Mode", {
-        "bm25":          "BM25",
-        "hnsw":          "HNSW",
-        "hybrid":        "Hybrid RRF",
-        "hybrid_rerank": "Hybrid + Rerank",
-        "agentic":       "Agentic",
+        "bm25":              "BM25",
+        "hnsw":              "HNSW",
+        "hybrid":            "Hybrid RRF",
+        "hybrid_rerank":     "Hybrid + Rerank",
+        "hybrid_llm_rerank": "Hybrid + LLM Rerank",
+        "agentic":           "Agentic",
     }.get(search_type, search_type.upper()))
     col_c.metric("Index", data.get("index", "—"))
 

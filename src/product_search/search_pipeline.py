@@ -532,7 +532,7 @@ class OpenSearchInference:
             "Just the product type, a plausible brand style, and 1-2 key attributes.\n\n"
             f"Query: {query}\n\nProduct title:"
         )
-        response = llm.invoke(prompt)
+        response = _llm_invoke_with_backoff(llm, prompt)
         raw = response.content
         if isinstance(raw, list):
             text = next((b.get("text", "") if isinstance(b, dict) else str(b) for b in raw), "")
@@ -579,7 +579,7 @@ class OpenSearchInference:
         )
 
         try:
-            response = llm.invoke(prompt)
+            response = _llm_invoke_with_backoff(llm, prompt)
             raw = response.content
             if isinstance(raw, list):
                 text = next((b.get("text", "") if isinstance(b, dict) else str(b) for b in raw), "")
@@ -803,6 +803,30 @@ class OpenSearchInference:
 
 
 # ── Module-level helper ───────────────────────────────────────────────────────
+
+def _llm_invoke_with_backoff(llm, prompt: str, *, inter_call_sleep: float = 2.0, max_retries: int = 5):
+    """
+    Invoke an LLM with exponential backoff on rate-limit errors (429 / ResourceExhausted)
+    and a fixed sleep after every successful call to stay within Gemini API quotas.
+
+    inter_call_sleep: seconds to wait after each successful call (default 1s).
+    Backoff schedule on 429: 5s, 10s, 20s, 40s, 80s.
+    """
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt)
+            time.sleep(inter_call_sleep)
+            return response
+        except Exception as e:
+            err = str(e).lower()
+            if any(tok in err for tok in ("429", "resource_exhausted", "quota", "rate limit")):
+                wait = 5 * (2 ** attempt)  # 5, 10, 20, 40, 80 seconds
+                print(f"\n[rate-limit] Gemini quota hit — waiting {wait}s before retry {attempt + 1}/{max_retries}")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"LLM invoke failed after {max_retries} retries due to rate limits")
+
 
 def _parse_permutation(output: str, n: int) -> List[int]:
     """

@@ -9,7 +9,7 @@ pydantic==2.10.4
 
 # LangChain / LangGraph — required by the agentic search endpoint (/search/agentic).
 # No ML models are loaded; these are orchestration + Vertex AI HTTP client packages only.
-langchain-google-genai>=2.1.0
+langchain-google-genai>=4.0.0
 langchain-core==1.2.18
 langgraph==1.1.1
 langsmith==0.7.16
