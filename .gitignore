@@ -209,3 +209,5 @@ __marimo__/
 .DS_Store
 *.env
 Data/PROCESSED/product_store.json
+CLAUDE.md
+.claude/

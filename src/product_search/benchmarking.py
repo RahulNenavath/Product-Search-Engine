@@ -141,6 +141,78 @@ def retrieve_hybrid_rerank(
     return preds
 
 
+def retrieve_hyde(
+    inference_client: OpenSearchInference,
+    *,
+    query_table: pd.DataFrame,
+    topn: int,
+    filter_source: Optional[str] = None,
+    candidate_pool_size: int = 25,
+    limit_queries: Optional[int] = None,
+) -> PredictedRankings:
+    """HyDE vector for HNSW leg + cross-encoder reranker."""
+    rows = list(query_table.itertuples(index=False))
+    if limit_queries:
+        rows = rows[:limit_queries]
+    preds: PredictedRankings = {}
+    for row in tqdm(rows, total=len(rows), desc="HyDE retrieval"):
+        preds[str(row.query_id)] = inference_client.ranked_ids_hybrid_rerank_hyde(
+            query=str(row.query),
+            k=topn,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+        )
+    return preds
+
+
+def retrieve_hybrid_llm_rerank(
+    inference_client: OpenSearchInference,
+    *,
+    query_table: pd.DataFrame,
+    topn: int,
+    filter_source: Optional[str] = None,
+    candidate_pool_size: int = 50,
+    limit_queries: Optional[int] = None,
+) -> PredictedRankings:
+    """Hybrid BM25+HNSW retrieval + Gemini Flash permutation reranker."""
+    rows = list(query_table.itertuples(index=False))
+    if limit_queries:
+        rows = rows[:limit_queries]
+    preds: PredictedRankings = {}
+    for row in tqdm(rows, total=len(rows), desc="Hybrid LLM Rerank retrieval"):
+        preds[str(row.query_id)] = inference_client.ranked_ids_hybrid_llm_rerank(
+            query=str(row.query),
+            k=topn,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+        )
+    return preds
+
+
+def retrieve_hyde_llm_rerank(
+    inference_client: OpenSearchInference,
+    *,
+    query_table: pd.DataFrame,
+    topn: int,
+    filter_source: Optional[str] = None,
+    candidate_pool_size: int = 50,
+    limit_queries: Optional[int] = None,
+) -> PredictedRankings:
+    """HyDE vector for HNSW leg + Gemini Flash permutation reranker."""
+    rows = list(query_table.itertuples(index=False))
+    if limit_queries:
+        rows = rows[:limit_queries]
+    preds: PredictedRankings = {}
+    for row in tqdm(rows, total=len(rows), desc="HyDE + LLM Rerank retrieval"):
+        preds[str(row.query_id)] = inference_client.ranked_ids_hybrid_hyde_llm_rerank(
+            query=str(row.query),
+            k=topn,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+        )
+    return preds
+
+
 def retrieve_agentic(
     inference_client: OpenSearchInference,
     *,
@@ -206,8 +278,19 @@ def main() -> None:
     ap.add_argument("--skip-hybrid-rrf", action="store_true", default=False)
     ap.add_argument("--skip-hybrid-rerank", action="store_true", default=False)
     ap.add_argument("--skip-agentic", action="store_true", default=False)
+    ap.add_argument("--skip-hyde", action="store_true", default=True,
+                    help="Skip HyDE ablation (default: skipped — incurs LLM API cost). Use --no-skip-hyde to enable.")
+    ap.add_argument("--no-skip-hyde", dest="skip_hyde", action="store_false")
+    ap.add_argument("--skip-hybrid-llm-rerank", action="store_true", default=True,
+                    help="Skip Hybrid+LLM reranker ablation (default: skipped). Use --no-skip-hybrid-llm-rerank to enable.")
+    ap.add_argument("--no-skip-hybrid-llm-rerank", dest="skip_hybrid_llm_rerank", action="store_false")
+    ap.add_argument("--skip-hyde-llm-rerank", action="store_true", default=True,
+                    help="Skip HyDE+LLM reranker ablation (default: skipped). Use --no-skip-hyde-llm-rerank to enable.")
+    ap.add_argument("--no-skip-hyde-llm-rerank", dest="skip_hyde_llm_rerank", action="store_false")
+    ap.add_argument("--llm-rerank-candidate-pool-size", type=int, default=50,
+                    help="Candidate pool size for LLM reranker ablations (default: 50).")
     ap.add_argument("--limit-queries", type=int, default=None,
-                    help="Cap number of queries for agentic retrieval (e.g. 50 for quick checks).")
+                    help="Cap number of queries for LLM-backed ablations (e.g. 50 for quick checks).")
     ap.add_argument("--out-dir", default="./runs")
 
     args = ap.parse_args()
@@ -326,6 +409,72 @@ def main() -> None:
         )
         scores.to_csv(out_dir / "hybrid_rerank_metrics.csv", index=False)
         print("\n[Hybrid Rerank] Metrics")
+        print(scores.to_string(index=False))
+
+    # ── HyDE ─────────────────────────────────────────────────────────────────
+    if not args.skip_hyde:
+        n_label = f"first {args.limit_queries}" if args.limit_queries else "all"
+        print(f"\n[HyDE] top-{args.topn} | candidate_pool={args.candidate_pool_size} | queries={n_label}")
+        hyde_ranked = retrieve_hyde(
+            inference,
+            query_table=test_queries,
+            topn=args.topn,
+            filter_source=filter_source,
+            candidate_pool_size=args.candidate_pool_size,
+            limit_queries=args.limit_queries,
+        )
+        save_json(out_dir / "hyde_ranked.json", hyde_ranked)
+        scores = evaluator.evaluate_rankings(
+            ground_truth_qrels=gt_qrels_raw,
+            predicted_rankings=hyde_ranked,
+            binary_threshold=args.binary_threshold,
+        )
+        scores.to_csv(out_dir / "hyde_metrics.csv", index=False)
+        print("\n[HyDE] Metrics")
+        print(scores.to_string(index=False))
+
+    # ── Hybrid LLM Rerank ─────────────────────────────────────────────────────
+    if not args.skip_hybrid_llm_rerank:
+        n_label = f"first {args.limit_queries}" if args.limit_queries else "all"
+        print(f"\n[Hybrid LLM Rerank] top-{args.topn} | candidate_pool={args.llm_rerank_candidate_pool_size} | queries={n_label}")
+        hybrid_llm_rerank_ranked = retrieve_hybrid_llm_rerank(
+            inference,
+            query_table=test_queries,
+            topn=args.topn,
+            filter_source=filter_source,
+            candidate_pool_size=args.llm_rerank_candidate_pool_size,
+            limit_queries=args.limit_queries,
+        )
+        save_json(out_dir / "hybrid_llm_rerank_ranked.json", hybrid_llm_rerank_ranked)
+        scores = evaluator.evaluate_rankings(
+            ground_truth_qrels=gt_qrels_raw,
+            predicted_rankings=hybrid_llm_rerank_ranked,
+            binary_threshold=args.binary_threshold,
+        )
+        scores.to_csv(out_dir / "hybrid_llm_rerank_metrics.csv", index=False)
+        print("\n[Hybrid LLM Rerank] Metrics")
+        print(scores.to_string(index=False))
+
+    # ── HyDE + LLM Rerank ────────────────────────────────────────────────────
+    if not args.skip_hyde_llm_rerank:
+        n_label = f"first {args.limit_queries}" if args.limit_queries else "all"
+        print(f"\n[HyDE + LLM Rerank] top-{args.topn} | candidate_pool={args.llm_rerank_candidate_pool_size} | queries={n_label}")
+        hyde_llm_rerank_ranked = retrieve_hyde_llm_rerank(
+            inference,
+            query_table=test_queries,
+            topn=args.topn,
+            filter_source=filter_source,
+            candidate_pool_size=args.llm_rerank_candidate_pool_size,
+            limit_queries=args.limit_queries,
+        )
+        save_json(out_dir / "hyde_llm_rerank_ranked.json", hyde_llm_rerank_ranked)
+        scores = evaluator.evaluate_rankings(
+            ground_truth_qrels=gt_qrels_raw,
+            predicted_rankings=hyde_llm_rerank_ranked,
+            binary_threshold=args.binary_threshold,
+        )
+        scores.to_csv(out_dir / "hyde_llm_rerank_metrics.csv", index=False)
+        print("\n[HyDE + LLM Rerank] Metrics")
         print(scores.to_string(index=False))
 
     # ── Agentic ───────────────────────────────────────────────────────────────

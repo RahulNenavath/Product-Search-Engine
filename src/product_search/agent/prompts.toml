@@ -177,6 +177,29 @@ Assess quality and recommend action.
 """
 
 
+[hyde]
+
+# IMPORTANT: The HNSW index stores vectors of encode_text = "title by brand, color" (~10-20 tokens).
+# Generating a long description encodes to a different vector distribution and hurts retrieval.
+# This prompt produces a short title+brand+attribute string matching the indexed document format.
+
+system = """
+You are an e-commerce product title writer. Given a search query, output ONLY a short product
+listing title (10-20 words) in the format: "Product Name by Brand Style, attribute"
+
+Examples:
+  Query: smart coffee table     → Smart Lift Coffee Table with Storage by HomePro, espresso
+  Query: ergonomic desk chair   → Ergonomic Mesh Office Chair with Lumbar Support by OfficePro, black
+  Query: air humidifier lilac   → Ultrasonic Cool Mist Humidifier by PureAir, lilac purple
+  Query: charm heart fleece blanket → Charm Heart Plush Fleece Throw Blanket by CozyHome, grey
+
+Do NOT invent specific model numbers. Do NOT write more than one line. Do NOT add explanations.
+"""
+
+user_template = """Query: {query}
+Product title:"""
+
+
 # ── Shared: hits_summary format ────────────────────────────────────────────────
 
 [hits_summary_format]

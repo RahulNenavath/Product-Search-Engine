@@ -496,6 +496,227 @@ class OpenSearchInference:
             )
         return out[:k]
 
+    # ── HyDE helpers ─────────────────────────────────────────────────────────
+
+    # Skip HyDE for queries that contain model numbers, digits (brand+model lookups),
+    # or clearly navigational terms — generating a hypothetical product for these adds noise.
+    _HYDE_SKIP_PATTERN = re.compile(
+        r'\d{2,}|\b(?:amazon|book|film|movie|song|album)\b', re.IGNORECASE
+    )
+
+    def generate_hyde_embedding(self, query: str) -> List[float]:
+        """
+        HyDE embedding: LLM writes a short encode_text-style product title
+        ("Product Name by Brand, color"), encoder embeds it, averaged 50/50 with the
+        raw query vector per HyDE paper Eq. 8.
+
+        Falls back to the raw query vector for navigational/garbled/model-number queries.
+
+        IMPORTANT — format rationale: the HNSW index stores vectors of `encode_text`
+        (title + brand + color, ~10-20 tokens). Generating a long description would fall
+        outside this vector distribution. We match the exact short format.
+        """
+        query_vec = self.encode([query])[0]
+
+        if self._HYDE_SKIP_PATTERN.search(query) or len(query.split()) <= 1:
+            return query_vec
+
+        from product_search.agent.llm import get_agent_llm
+        llm = get_agent_llm("understand_query")
+
+        prompt = (
+            "Write a short product listing title (10-20 words max) for an e-commerce product "
+            "that would satisfy this search query. "
+            "Format: 'Product Name by Brand, attribute'. "
+            "Do not invent specific model numbers. "
+            "Just the product type, a plausible brand style, and 1-2 key attributes.\n\n"
+            f"Query: {query}\n\nProduct title:"
+        )
+        response = llm.invoke(prompt)
+        raw = response.content
+        if isinstance(raw, list):
+            text = next((b.get("text", "") if isinstance(b, dict) else str(b) for b in raw), "")
+        else:
+            text = raw
+        hypothetical_doc = text.strip().splitlines()[0]
+
+        hyde_vec = self.encode([hypothetical_doc])[0]
+        avg_vec = [0.5 * q + 0.5 * h for q, h in zip(query_vec, hyde_vec)]
+        return avg_vec
+
+    # ── LLM permutation reranker ──────────────────────────────────────────────
+
+    def _rerank_llm_permutation(self, query: str, candidates: List[SearchHit]) -> List[SearchHit]:
+        """
+        LLM permutation reranker: single-pass full-list ranking.
+
+        No sliding window needed — with pool ≤ 50 and candidates truncated to 300 chars,
+        the prompt fits comfortably in Gemini Flash-lite's 32k context (~2-4k tokens).
+        The sliding window in RankGPT was only necessary for 100+ candidates with GPT-3.5's
+        4k context limit.
+
+        Uses encode_text (short title+brand+color) to match the indexed document format.
+        Falls back to original order on any parse or API failure.
+        """
+        from product_search.agent.llm import get_agent_llm
+        llm = get_agent_llm("understand_query")
+
+        n = len(candidates)
+        if n == 0:
+            return candidates
+
+        passages = "\n".join(
+            f"[{i + 1}] {(c.encode_text or c.full_text)[:300]}"
+            for i, c in enumerate(candidates)
+        )
+        prompt = (
+            f"I will provide you with {n} product listings numbered [1] to [{n}].\n"
+            f"Rank them by relevance to the search query: \"{query}\"\n\n"
+            f"{passages}\n\n"
+            f"Output the ranking from most to least relevant using ONLY the identifiers "
+            f"in order, separated by ' > '. Example for 3 items: [2] > [1] > [3]\n"
+            f"Include ALL {n} identifiers. Output nothing else."
+        )
+
+        try:
+            response = llm.invoke(prompt)
+            raw = response.content
+            if isinstance(raw, list):
+                text = next((b.get("text", "") if isinstance(b, dict) else str(b) for b in raw), "")
+            else:
+                text = raw
+            order = _parse_permutation(text.strip(), n)
+            return [candidates[i] for i in order]
+        except Exception:
+            return candidates
+
+    # ── Public search methods (HyDE / LLM reranker) ───────────────────────────
+
+    def query_hybrid_rerank_hyde(
+        self,
+        query: str,
+        *,
+        k: int = 10,
+        filter_source: Optional[str] = None,
+        candidate_pool_size: int = 25,
+        include_full_text: bool = True,
+    ) -> List[SearchHit]:
+        """
+        Hybrid BM25+HNSW retrieval + cross-encoder reranker.
+        HNSW leg uses the HyDE-averaged vector instead of the raw query vector.
+        BM25 and cross-encoder reranker are unchanged.
+        """
+        hyde_vector = self.generate_hyde_embedding(query)
+
+        bm25_hits = self.query_bm25(
+            query=query,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+        )
+        hnsw_hits = self.query_hnsw(
+            query=query,
+            vector=hyde_vector,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+        )
+
+        by_id: Dict[str, SearchHit] = {}
+        for h in bm25_hits:
+            if h.product_id:
+                by_id.setdefault(str(h.product_id), h)
+        for h in hnsw_hits:
+            if h.product_id:
+                by_id[str(h.product_id)] = h
+
+        candidates = list(by_id.values())
+        if not candidates:
+            return []
+
+        texts = [h.encode_text or h.full_text for h in candidates]
+        scores = self._rerank_scores(query, texts)
+        scored = sorted(zip(candidates, scores), key=lambda x: float(x[1]), reverse=True)
+
+        return [
+            SearchHit(
+                product_id=h.product_id,
+                score=float(s),
+                source=h.source,
+                metadata=h.metadata,
+                full_text=h.full_text if include_full_text else "",
+                encode_text=h.encode_text,
+            )
+            for h, s in scored
+        ][:k]
+
+    def query_hybrid_llm_rerank(
+        self,
+        query: str,
+        vector: Optional[List[float]] = None,
+        *,
+        k: int = 10,
+        filter_source: Optional[str] = None,
+        candidate_pool_size: int = 50,
+        include_full_text: bool = True,
+    ) -> List[SearchHit]:
+        """
+        Hybrid BM25+HNSW retrieval, re-ranked by Gemini Flash permutation generation
+        instead of the cross-encoder. Uses a larger default pool (50 vs 25) since there
+        is no per-text encoding overhead.
+        """
+        bm25_hits = self.query_bm25(
+            query=query,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+        )
+        hnsw_hits = self.query_hnsw(
+            query=query,
+            vector=vector,
+            k=candidate_pool_size,
+            filter_source=filter_source,
+            include_full_text=include_full_text,
+        )
+
+        by_id: Dict[str, SearchHit] = {}
+        for h in bm25_hits:
+            if h.product_id:
+                by_id.setdefault(str(h.product_id), h)
+        for h in hnsw_hits:
+            if h.product_id:
+                by_id[str(h.product_id)] = h
+
+        candidates = list(by_id.values())
+        if not candidates:
+            return []
+
+        ranked = self._rerank_llm_permutation(query, candidates)
+        return ranked[:k]
+
+    def query_hybrid_hyde_llm_rerank(
+        self,
+        query: str,
+        *,
+        k: int = 10,
+        filter_source: Optional[str] = None,
+        candidate_pool_size: int = 50,
+        include_full_text: bool = True,
+    ) -> List[SearchHit]:
+        """
+        HyDE vector for the HNSW leg + Gemini Flash permutation reranker.
+        Combines both ablations.
+        """
+        hyde_vector = self.generate_hyde_embedding(query)
+        return self.query_hybrid_llm_rerank(
+            query=query,
+            vector=hyde_vector,
+            k=k,
+            filter_source=filter_source,
+            candidate_pool_size=candidate_pool_size,
+            include_full_text=include_full_text,
+        )
+
     # ── Ranked-ID helpers (used by benchmarking) ──────────────────────────────
 
     def ranked_ids_bm25(
@@ -564,3 +785,39 @@ class OpenSearchInference:
             include_full_text=True,
         )
         return [str(h.product_id) for h in hits]
+
+    def ranked_ids_hybrid_rerank_hyde(
+        self, query: str, *, k: int = 10, filter_source: Optional[str] = None, candidate_pool_size: int = 25
+    ) -> List[str]:
+        return [str(h.product_id) for h in self.query_hybrid_rerank_hyde(query=query, k=k, filter_source=filter_source, candidate_pool_size=candidate_pool_size)]
+
+    def ranked_ids_hybrid_llm_rerank(
+        self, query: str, *, k: int = 10, filter_source: Optional[str] = None, candidate_pool_size: int = 50
+    ) -> List[str]:
+        return [str(h.product_id) for h in self.query_hybrid_llm_rerank(query=query, k=k, filter_source=filter_source, candidate_pool_size=candidate_pool_size)]
+
+    def ranked_ids_hybrid_hyde_llm_rerank(
+        self, query: str, *, k: int = 10, filter_source: Optional[str] = None, candidate_pool_size: int = 50
+    ) -> List[str]:
+        return [str(h.product_id) for h in self.query_hybrid_hyde_llm_rerank(query=query, k=k, filter_source=filter_source, candidate_pool_size=candidate_pool_size)]
+
+
+# ── Module-level helper ───────────────────────────────────────────────────────
+
+def _parse_permutation(output: str, n: int) -> List[int]:
+    """
+    Parse LLM permutation output '[2] > [1] > [3]' into 0-indexed list [1, 0, 2].
+    Missing or duplicate identifiers are appended in original order for stability.
+    """
+    matches = re.findall(r'\[(\d+)\]', output)
+    seen: set = set()
+    order: List[int] = []
+    for m in matches:
+        idx = int(m) - 1
+        if 0 <= idx < n and idx not in seen:
+            order.append(idx)
+            seen.add(idx)
+    for i in range(n):
+        if i not in seen:
+            order.append(i)
+    return order
