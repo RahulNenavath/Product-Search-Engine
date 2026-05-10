@@ -19,13 +19,14 @@ ML models (encoder + reranker) are served from a **GPU-backed Cloud Run service 
 4. [Data Curation](#data-curation)
 5. [Search Engine Architecture](#search-engine-architecture)
 6. [Encoder Fine-tuning](#encoder-fine-tuning)
-7. [Evaluation and Metrics](#evaluation-and-metrics)
-8. [Results](#results)
-9. [System Components and Docker](#system-components-and-docker)
-10. [GCP Setup — Embedding Service](#gcp-setup--embedding-service)
-11. [CI/CD — GitHub Actions](#cicd--github-actions)
-12. [Quickstart](#quickstart)
-13. [Repository Structure](#repository-structure)
+7. [Agentic Search Architecture](#agentic-search-architecture)
+8. [Evaluation and Metrics](#evaluation-and-metrics)
+9. [Results](#results)
+10. [System Components and Docker](#system-components-and-docker)
+11. [GCP Setup — Embedding Service](#gcp-setup--embedding-service)
+12. [CI/CD — GitHub Actions](#cicd--github-actions)
+13. [Quickstart](#quickstart)
+14. [Repository Structure](#repository-structure)
 
 ---
 
@@ -39,6 +40,7 @@ This repository implements and compares multiple retrieval approaches:
 2. **Dense retrieval (HNSW k-NN)** over learned embeddings — improves recall for paraphrases and intent-level matches beyond keyword overlap.
 3. **Hybrid retrieval** (BM25 + HNSW) with rank aggregation — **Reciprocal Rank Fusion (RRF)** to combine lexical + semantic candidates.
 4. **Hybrid + Cross-encoder reranking** — refines the final ordering over a candidate pool using a stronger interaction model.
+5. **Agentic search** (LangGraph + Gemini Flash) — a LangGraph pipeline that rewrites and normalises the query before retrieval, then assesses result quality and optionally retries with a wider candidate pool or decomposes multi-constraint queries.
 
 ---
 
@@ -199,6 +201,93 @@ Default hyperparameters: `C = 25` per method (smaller pool → reranker sees hig
 
 ---
 
+## Agentic Search Architecture
+
+The agentic search endpoint (`POST /search/agentic`) wraps `hybrid_rerank` in a **LangGraph** orchestration loop powered by two Gemini Flash models on Vertex AI. The agent's job is purely query understanding and result quality assessment — retrieval always uses `hybrid_rerank`.
+
+### Pipeline Flow
+
+```
+raw_query
+    │
+    ▼
+[understand_query]  gemini-3.1-flash-lite-preview
+  Rewrites query: strips filler, bridges vocabulary gaps, expands underspecified terms
+  Extracts: filter_source (ESCI | WANDS | none)
+  Classifies: complexity (simple | complex)
+    │
+    ▼
+[retrieve]          hybrid_rerank (BM25 + HNSW + cross-encoder, pool=25)
+  → hits: List[SearchHit]
+  → iteration += 1
+    │
+    ├── complexity == "simple"  ──────────────────────────────────► END
+    │
+    ▼
+[assess_results]    gemini-3-flash-preview
+  Judges top-5 results (with reranker scores) against original query
+  quality: good | low_coverage | wrong_category | semantic_drift | multi_constraint_miss
+  action:  return | widen | decompose
+    │
+    ├── "return" or iteration ≥ 2  ──────────────────────────────► END
+    │
+    ├── "widen"  →  candidate_pool_size × 2  ──────────────────► [retrieve]
+    │
+    └── "decompose"  →  split into 2 sub-queries, retrieve both, merge  ──► END
+```
+
+### Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Retrieval strategy | Always `hybrid_rerank` | Removes routing complexity; reranker quality is consistent |
+| `understand_query` model | `gemini-3.1-flash-lite-preview` | Fast and cheap; structured output via Pydantic |
+| `assess_results` model | `gemini-3-flash-preview` | Stronger reasoning for quality judgement |
+| Simple query shortcut | Skip `assess_results` | Saves one LLM call for the majority of queries |
+| Max iterations | 2 | Prevents runaway loops; `assess_results` always returns on iteration ≥ 2 |
+| Vertex AI region | `global` | Gemini 3 preview models are only available on the global endpoint |
+| Structured output | Pydantic with `str = ""` defaults | Vertex AI protobuf rejects `Optional[str]` / `null` types |
+
+### Query Rewriting Rules (IR-grounded)
+
+The `understand_query` prompt applies evidence-based rewriting designed for hybrid BM25 + HNSW retrieval:
+
+- **Pass-through (no rewrite):** brand + model queries (`"braun thermoscan 5"`), navigational queries (person names, product names), garbled text, and service queries (`"amazon rewards points"`)
+- **Vocabulary gap bridging:** append the catalog synonym rather than replace (`"couch"` → `"couch sofa"`) so BM25 retains both tokens
+- **Expansion:** only for 1–2 word underspecified category queries (`"rug"` → `"area rug carpet"`)
+- **Attribute preservation:** all stated constraints (color, material, price signals, negations) must survive verbatim
+
+### Result Assessment (Score-Aware)
+
+`assess_results` receives the top-5 hits with their **cross-encoder reranker scores**, enabling score-threshold reasoning alongside snippet analysis:
+
+- Score ≥ 0.5 → strong match; default to `return`
+- Score < 0.1 → retrieval failure; consider `widen` for `low_coverage`
+- `widen` is only triggered for `low_coverage` — it does not help `wrong_category` or `semantic_drift`
+
+### Current Performance and Limitations
+
+Benchmarked on the full 200-query test set (100 ESCI + 100 WANDS):
+
+| Metric | hybrid_rerank | agentic (v1) | Δ |
+|---|---|---|---|
+| NDCG@5 | **0.682** | 0.657 | −3.7% |
+| NDCG@10 | **0.661** | 0.635 | −3.9% |
+| NDCG@20 | **0.651** | 0.628 | −3.5% |
+| MRR@5 | **0.826** | 0.804 | −2.7% |
+| Recall@20 | **0.476** | 0.459 | −3.6% |
+| Latency | ~0.5 s | ~3.7 s | 7× slower |
+
+The v1 agent slightly underperforms the baseline because the hybrid_rerank pipeline (fine-tuned encoder + cross-encoder reranker) already handles vocabulary gaps, making query rewriting redundant for most queries. The LLM rewrites introduce marginal noise on well-specified queries that outweighs the gains on ambiguous ones.
+
+**Planned v2 architecture** addresses this by removing query rewriting and instead using the LLM for:
+
+1. **Structured filter extraction** — colour and brand constraints become OpenSearch hard filters (not soft query tokens), directly improving precision
+2. **Query-type routing** — navigational/brand-model queries take a BM25-only fast path; multi-constraint queries are decomposed before retrieval rather than after
+3. **Score-threshold gating** — `assess_results` is replaced by a heuristic: if the top-1 reranker score is below a threshold, widen and retry without any LLM call
+
+---
+
 ## Encoder Fine-tuning
 
 Dense retrieval quality depends on how well the encoder maps **(query, product)** text into a shared embedding space. Off-the-shelf encoders are not optimised for product-search relevance, so this project fine-tunes a `SentenceTransformer` on dataset-specific training pairs.
@@ -250,7 +339,7 @@ Average of `1 / rank` of the first relevant result across all queries. Strong pr
 
 ## Results
 
-All metrics are computed on held-out test sets (100 ESCI + 100 WANDS queries), `top-100` retrieval pool, cutoffs K ∈ {5, 10, 20}.
+All metrics are computed on held-out test sets (100 ESCI + 100 WANDS queries), `top-100` retrieval pool, cutoffs K ∈ {5, 10, 20}. Hybrid Rerank results are from a 9,100-query ablation run; all other results from the 200-query test set.
 
 ### NDCG@K
 
@@ -260,6 +349,7 @@ All metrics are computed on held-out test sets (100 ESCI + 100 WANDS queries), `
 | HNSW (Fine-tuned Encoder) | 0.6335 | 0.6149 | 0.6031 |
 | Hybrid RRF (BM25 + HNSW, C=50) | 0.6576 | 0.6373 | 0.6176 |
 | **Hybrid + Cross-Encoder Reranker (C=25)** | **0.6824** | **0.6608** | **0.6510** |
+| Agentic (Gemini Flash + hybrid_rerank) | 0.6574 | 0.6347 | 0.6282 |
 
 ### MRR@K
 
@@ -268,7 +358,8 @@ All metrics are computed on held-out test sets (100 ESCI + 100 WANDS queries), `
 | BM25 | 0.7598 | 0.7671 | 0.7689 |
 | HNSW (Fine-tuned Encoder) | 0.8141 | 0.8176 | 0.8186 |
 | Hybrid RRF | 0.8418 | 0.8466 | 0.8470 |
-| **Hybrid + Cross-Encoder Reranker** | 0.8262 | 0.8305 | 0.8316 |
+| **Hybrid + Cross-Encoder Reranker** | **0.8262** | **0.8305** | **0.8316** |
+| Agentic (Gemini Flash + hybrid_rerank) | 0.8043 | 0.8093 | 0.8106 |
 
 ### Recall@K
 
@@ -278,17 +369,20 @@ All metrics are computed on held-out test sets (100 ESCI + 100 WANDS queries), `
 | HNSW (Fine-tuned Encoder) | 0.1662 | 0.2951 | 0.4440 |
 | Hybrid RRF | 0.1705 | 0.2976 | 0.4471 |
 | **Hybrid + Cross-Encoder Reranker** | **0.1839** | **0.3151** | **0.4758** |
+| Agentic (Gemini Flash + hybrid_rerank) | 0.1786 | 0.3060 | 0.4593 |
 
 ### Key Findings
 
 1. **Multi-field BM25 with per-field boosting** (`title^5, brand_text^4, bullets^2, description^0.3`) lifts the BM25 baseline from ~0.586 to 0.603 NDCG@5 compared to a single `full_text` field — making it a stronger stage-1 retriever.
 2. **Fine-tuned encoder outperforms BM25 at every cutoff**, confirming the encoder better captures domain-level relevance beyond keyword overlap (+5 pp NDCG@5).
 3. **Hybrid RRF is a strong, calibration-free improvement** — it reaches NDCG@5 = 0.658 without any additional learned components, a +9 pp gain over BM25.
-4. **Hybrid + Cross-Encoder Reranker is the best configuration at all cutoffs** (NDCG@5 = 0.682, +13 pp vs BM25). With a tuned candidate pool of 25, the reranker leads at NDCG@20 = 0.651 as well — there is no longer a depth-based rank inversion.
+4. **Hybrid + Cross-Encoder Reranker is the best configuration at all cutoffs** (NDCG@5 = 0.682, +13 pp vs BM25). Candidate pool C=25 was found to be optimal — larger pools feed the reranker more noise than signal.
 5. **MRR is highest for Hybrid RRF** (0.847), slightly above the reranker (0.832), suggesting RRF is better at surfacing *a* relevant result at rank 1, while the reranker better handles the full top-K ordering.
+6. **Agentic search (v1) scores slightly below the hybrid_rerank baseline** (NDCG@20: 0.628 vs 0.651, −3.5%) despite using the same retrieval backend. LLM query rewriting introduces marginal noise on the ~80% of well-specified queries for which the fine-tuned encoder already handles vocabulary gaps. Latency is 7× higher (~3.7 s vs ~0.5 s). A v2 design replacing rewriting with structured filter extraction and query-type routing is in progress.
 
 > **For production ranking** (k ≤ 20): use **Hybrid + Cross-Encoder Reranker**.
 > **For recall-oriented retrieval** (broad candidates, fast latency): use **Hybrid RRF**.
+> **For agentic / conversational search**: use the `/search/agentic` endpoint (LangGraph + Gemini Flash); note higher latency and ongoing development.
 
 ---
 
@@ -319,6 +413,7 @@ The system runs as three local Docker services orchestrated by `docker-compose.y
 | `POST` | `/search/hnsw` | Dense semantic search (fine-tuned encoder) |
 | `POST` | `/search/hybrid` | Hybrid BM25 + HNSW via RRF |
 | `POST` | `/search/hybrid_rerank` | Hybrid RRF + cross-encoder reranking |
+| `POST` | `/search/agentic` | LangGraph agent (Gemini Flash) + hybrid_rerank; returns `rewritten_query` field |
 
 **Request body** (all search endpoints):
 
@@ -337,7 +432,8 @@ The system runs as three local Docker services orchestrated by `docker-compose.y
 - Built from [`ui/Dockerfile`](ui/Dockerfile)
 - Streamlit application ([`ui/app.py`](ui/app.py)) that calls the `api` service internally via `http://api:8000`
 - Exposes a visual search interface at `localhost:8501`
-- Features: search mode toggle (BM25 / HNSW / Hybrid / Hybrid+Rerank), `k` slider, source filter, live API health check, results as expandable cards
+- Features: search mode toggle (BM25 / HNSW / Hybrid / Hybrid+Rerank / Agentic), `k` slider, source filter, live API health check, results as expandable cards
+- Agentic mode shows the rewritten query in a highlighted info box for transparency
 
 ### Service: `embedding_service` (GCP Cloud Run)
 
@@ -642,7 +738,13 @@ Product-Search-Engine/
 ├── src/product_search/
 │   ├── data_curation.py                   # ESCIProcessor, WANDSProcessor, DatasetMerger
 │   ├── search_pipeline.py                 # OpenSearchInference: BM25, HNSW, Hybrid, Rerank
-│   └── ...
+│   ├── benchmarking.py                    # End-to-end evaluation: all strategies + agentic
+│   └── agent/
+│       ├── state.py                       # AgentState TypedDict
+│       ├── nodes.py                       # understand_query, retrieve, assess_results, decompose nodes
+│       ├── graph.py                       # LangGraph StateGraph + run_agent() public entry point
+│       ├── llm.py                         # ChatGoogleGenerativeAI setup (Vertex AI, global endpoint)
+│       └── prompts.toml                   # System + user prompt templates for all LLM nodes
 │
 ├── ui/
 │   ├── Dockerfile
@@ -657,4 +759,4 @@ Product-Search-Engine/
 
 ---
 
-> **Summary:** Hybrid retrieval with a fine-tuned bi-encoder + cross-encoder reranking is the top-performing configuration at all depth cutoffs (NDCG@5 = 0.682, NDCG@10 = 0.661, NDCG@20 = 0.651 — all best-in-class). BM25 uses multi-field boosting across `title`, `brand_text`, `bullets`, and `description`; the dense encoder uses a short `encode_text` field (title + brand + color) matching its fine-tuning representation. Encoding and reranking are handled by a GPU-backed Cloud Run service that loads models from GCS at boot — keeping Docker images small and model updates independent of application deploys. The local stack (OpenSearch + FastAPI + Streamlit) runs entirely in Docker Compose.
+> **Summary:** Hybrid retrieval with a fine-tuned bi-encoder + cross-encoder reranking (candidate pool C=25) is the top-performing configuration at all depth cutoffs (NDCG@5 = 0.682, NDCG@10 = 0.661, NDCG@20 = 0.651). BM25 uses multi-field boosting across `title`, `brand_text`, `bullets`, and `description`; the dense encoder uses a short `encode_text` field (title + brand + color) matching its fine-tuning representation. Encoding and reranking are handled by a GPU-backed Cloud Run service that loads models from GCS at boot. An experimental **agentic search layer** (LangGraph + Gemini Flash) wraps hybrid_rerank with query understanding and result assessment; v1 benchmarks at NDCG@20 = 0.628 (−3.5% vs baseline) due to marginal noise from query rewriting on well-specified queries — a v2 design using structured filter extraction and query-type routing is planned.
